@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import mujoco
 
+from env import FactoryFloorEnv
 
-model = mujoco.MjModel.from_xml_path("third_party/menagerie/universal_robots_ur5e/scene.xml")
-data = mujoco.MjData(model)
-mujoco.mj_forward(model, data)
+env = FactoryFloorEnv()
+mujoco.mj_forward(env.model, env.data)
 
-print({"nq": model.nq, "nu": model.nu, "time": data.time})
+print({"nq": env.model.nq, "nu": env.model.nu, "time": env.data.time})
+print(env.describe_task())
