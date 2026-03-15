@@ -64,14 +64,6 @@ class FactoryFloorEnv:
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_target"
             ),
         }
-        self.drop_site_ids = {
-            "blue": mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_blue_hover"
-            ),
-            "orange": mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_hover"
-            ),
-        }
         self.part_body_ids = {
             name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, spec["body"])
             for name, spec in self.part_specs.items()
@@ -126,18 +118,22 @@ class FactoryFloorEnv:
                 [-3.4238, -1.5175, 1.1241, -2.0522, -2.3687, 0.0], dtype=float
             ),
         }
+        self.drop_hover_height = 0.19
         self.drop_targets = {
             name: self.data.site_xpos[site_id].copy()
-            for name, site_id in self.drop_site_ids.items()
+            + np.array([0.0, 0.0, self.drop_hover_height], dtype=float)
+            for name, site_id in self.bin_site_ids.items()
         }
         self.drop_poses = {
             "blue": np.array(
-                [-3.0880, -1.4200, 0.8150, -1.7760, -1.5940, 0.8710], dtype=float
+                [-2.9784, -0.8520, 0.2509, -2.1568, -1.4822, 0.8710], dtype=float
             ),
             "orange": np.array(
-                [-3.6700, -1.5130, 1.1450, -2.1370, -1.6740, 0.0], dtype=float
+                [-3.6801, -0.8598, 0.3313, -2.4060, -1.5532, 0.0], dtype=float
             ),
         }
+        self.drop_release_xy_tol = 0.03
+        self.drop_release_z_tol = 0.025
         self.reset()
 
     def reset(self) -> tuple[np.ndarray, dict]:
@@ -152,6 +148,22 @@ class FactoryFloorEnv:
 
     def step(self, action: np.ndarray) -> StepResult:
         self.set_arm_configuration(action)
+        return StepResult(
+            observation=self._get_observation(),
+            reward=self._task_reward(),
+            terminated=False,
+            truncated=False,
+            info=self._get_info(),
+        )
+
+    def scripted_step(self, t: float) -> StepResult:
+        self.data.time = float(t)
+        self._set_robot_configuration(self.scripted_action(t))
+        if self.holding_part is not None:
+            self._update_attachment()
+        self._update_task_progress()
+        if self.holding_part is not None:
+            self._update_attachment()
         return StepResult(
             observation=self._get_observation(),
             reward=self._task_reward(),
@@ -245,7 +257,7 @@ class FactoryFloorEnv:
                 self._update_attachment()
             return
         target_bin = self.part_specs[self.holding_part]["bin"]
-        if self._ee_close_to_bin(target_bin, tol=0.07):
+        if self._ee_ready_to_drop(target_bin):
             self._drop_part_in_bin(self.holding_part, target_bin)
 
     def _update_attachment(self) -> None:
@@ -265,14 +277,14 @@ class FactoryFloorEnv:
             float(np.linalg.norm(self.data.site_xpos[self.ee_site_id] - target)) < tol
         )
 
-    def _ee_close_to_bin(self, bin_name: str, tol: float = 0.04) -> bool:
+    def _ee_ready_to_drop(self, bin_name: str) -> bool:
+        ee_pos = self.data.site_xpos[self.ee_site_id]
+        target = self.drop_targets[bin_name]
+        xy_error = float(np.linalg.norm(ee_pos[:2] - target[:2]))
+        z_error = float(abs(ee_pos[2] - target[2]))
         return (
-            float(
-                np.linalg.norm(
-                    self.data.site_xpos[self.ee_site_id] - self.drop_targets[bin_name]
-                )
-            )
-            < tol
+            xy_error < self.drop_release_xy_tol
+            and z_error < self.drop_release_z_tol
         )
 
     def _drop_part_in_bin(self, part_name: str, bin_name: str) -> None:

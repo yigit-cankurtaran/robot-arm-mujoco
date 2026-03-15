@@ -10,6 +10,7 @@ from env import FactoryFloorEnv
 
 def main() -> None:
     env = FactoryFloorEnv()
+    script_time = 0.0
     print(env.describe_task())
     with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
         viewer.cam.azimuth = 138
@@ -18,8 +19,9 @@ def main() -> None:
         viewer.cam.lookat[:] = (0.62, 0.0, 0.68)
         while viewer.is_running():
             start = time.perf_counter()
-            env.step(env.scripted_action(env.data.time))
+            env.scripted_step(script_time)
             viewer.sync()
+            script_time += env.control_dt
             remaining = env.control_dt - (time.perf_counter() - start)
             if remaining > 0:
                 time.sleep(remaining)
