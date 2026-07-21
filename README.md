@@ -22,6 +22,15 @@ uv pip install --python .venv/bin/python -r requirements.txt
 
 Use `.venv/bin/mjpython check_env.py` if you make any changes and want to confirm the scene still loads.
 
+Run the deterministic headless motion audit after controller or scene changes:
+
+```bash
+.venv/bin/python audit_motion.py --seeds 20
+```
+
+It checks full-cycle completion and timing, commanded joint velocity,
+acceleration and jerk, tracking error, and robot contacts with the workcell.
+
 ## What This Repo Contains
 
 - `third_party/menagerie/universal_robots_ur5e/workcell_scene.xml`
@@ -32,6 +41,8 @@ Use `.venv/bin/mjpython check_env.py` if you make any changes and want to confir
   The interactive viewer entrypoint. It launches MuJoCo and runs the robot through repeated pick-and-sort cycles.
 - `check_env.py`
   A quick smoke test that loads the full workcell and prints the initial task description.
+- `audit_motion.py`
+  A deterministic, headless speed/smoothness/collision regression check.
 
 ## How The Sorting Demo Works
 

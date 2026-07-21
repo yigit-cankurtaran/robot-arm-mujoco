@@ -36,6 +36,20 @@ class FactoryFloorEnv:
         self.control_dt = self.model.opt.timestep * self.control_substeps
         self.home_ctrl = np.array([-3.25, -1.72, 1.48, -1.72, -3.05, 0.0], dtype=float)
 
+        # Per-joint limits for the commanded minimum-jerk trajectories.  These are
+        # deliberately below the UR5e hardware limits while being considerably
+        # quicker than the old controller's unconstrained actuator settling.
+        self.max_joint_velocity = np.array(
+            [1.8, 1.8, 2.2, 2.4, 2.4, 2.4], dtype=float
+        )
+        self.max_joint_acceleration = np.array(
+            [7.0, 7.0, 8.0, 10.0, 10.0, 10.0], dtype=float
+        )
+        self.max_joint_jerk = np.array(
+            [55.0, 55.0, 65.0, 80.0, 80.0, 80.0], dtype=float
+        )
+        self.min_trajectory_duration = 0.24
+
         self.ik_iterations = 32
         self.ik_damping = 0.08
         self.ik_step_scale = 0.8
@@ -44,7 +58,7 @@ class FactoryFloorEnv:
         self.ik_max_update = 0.35
 
         self.pick_offset = np.array([0.0, 0.0, 0.09], dtype=float)
-        self.pick_hover_offset = np.array([0.0, 0.0, 0.19], dtype=float)
+        self.pick_hover_offset = np.array([0.0, 0.0, 0.15], dtype=float)
         self.transfer_target = np.array([0.45, 0.0, 0.90], dtype=float)
         self.home_position_tol = 0.06
         self.phase_position_tol = 0.05
@@ -115,6 +129,16 @@ class FactoryFloorEnv:
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_hover"
             ),
         }
+        # The lower orange approach avoids the UR5e's upper-arm/table grazing
+        # posture while retaining clearance over the bin walls.
+        self.model.site_pos[self.bin_approach_site_ids["orange"], 2] = 0.70
+        pedestal_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "robot_pedestal"
+        )
+        # The decorative pedestal encloses the fixed robot base and otherwise
+        # creates permanent false contacts with its collision capsules.
+        self.model.geom_contype[pedestal_geom_id] = 0
+        self.model.geom_conaffinity[pedestal_geom_id] = 0
         self.part_body_ids = {
             name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, spec["body"])
             for name, spec in self.part_specs.items()
@@ -156,6 +180,13 @@ class FactoryFloorEnv:
         self.last_pick_hover_target = self.home_ee_target.copy()
         self.spawn_layout: dict[str, np.ndarray] = {}
 
+        self.trajectory_phase: str | None = None
+        self.trajectory_start = self.home_ctrl.copy()
+        self.trajectory_goal = self.home_ctrl.copy()
+        self.trajectory_elapsed = 0.0
+        self.trajectory_duration = self.min_trajectory_duration
+        self.contact_pairs_this_step: set[tuple[int, int]] = set()
+
         self.reset()
 
     def reset(self) -> tuple[np.ndarray, dict]:
@@ -170,6 +201,7 @@ class FactoryFloorEnv:
         self.completed_parts = set()
         self.controller_phase = "select_part"
         self.last_pick_hover_target = self.home_ee_target.copy()
+        self._reset_joint_trajectory()
         return self._get_observation(), self._get_info()
 
     def step(self, action: np.ndarray) -> StepResult:
@@ -188,7 +220,8 @@ class FactoryFloorEnv:
         self._advance_controller_state()
         target_pos = self._controller_target_position()
         target_q = self._solve_inverse_kinematics(target_pos)
-        self.set_arm_configuration(target_q)
+        smooth_target_q = self._trajectory_command(target_q)
+        self.set_arm_configuration(smooth_target_q)
         self._advance_controller_state()
         return StepResult(
             observation=self._get_observation(),
@@ -198,13 +231,66 @@ class FactoryFloorEnv:
             info=self._get_info(),
         )
 
+    def _reset_joint_trajectory(self) -> None:
+        current = self.data.ctrl.copy()
+        self.trajectory_phase = None
+        self.trajectory_start = current.copy()
+        self.trajectory_goal = current.copy()
+        self.trajectory_elapsed = 0.0
+        self.trajectory_duration = self.min_trajectory_duration
+
+    def _trajectory_command(self, target_q: np.ndarray) -> np.ndarray:
+        """Return a speed-limited C2-continuous joint command for this phase."""
+        target_q = np.clip(target_q, self.ctrl_low, self.ctrl_high)
+        if self.trajectory_phase != self.controller_phase:
+            self.trajectory_phase = self.controller_phase
+            self.trajectory_start = self.data.ctrl.copy()
+            self.trajectory_goal = target_q.copy()
+            self.trajectory_elapsed = 0.0
+            delta = np.abs(self.trajectory_goal - self.trajectory_start)
+
+            # Extrema for p(s)=10s^3-15s^4+6s^5 are 1.875 velocity,
+            # 5.7735 acceleration, and 60 jerk (with unit duration).
+            velocity_time = 1.875 * delta / self.max_joint_velocity
+            acceleration_time = np.sqrt(
+                5.7735 * delta / self.max_joint_acceleration
+            )
+            jerk_time = np.cbrt(60.0 * delta / self.max_joint_jerk)
+            if float(np.max(delta)) < 1e-6:
+                self.trajectory_duration = self.control_dt
+            else:
+                self.trajectory_duration = max(
+                    self.min_trajectory_duration,
+                    float(np.max(velocity_time)),
+                    float(np.max(acceleration_time)),
+                    float(np.max(jerk_time)),
+                )
+
+        self.trajectory_elapsed = min(
+            self.trajectory_elapsed + self.control_dt, self.trajectory_duration
+        )
+        s = self.trajectory_elapsed / self.trajectory_duration
+        blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+        return self.trajectory_start + blend * (
+            self.trajectory_goal - self.trajectory_start
+        )
+
+    def _trajectory_complete(self) -> bool:
+        return self.trajectory_elapsed >= self.trajectory_duration
+
     def set_arm_configuration(self, qpos: np.ndarray) -> None:
         target = np.clip(qpos, self.ctrl_low, self.ctrl_high)
         self.data.ctrl[:] = target
+        self.contact_pairs_this_step.clear()
         for _ in range(self.control_substeps):
             if self.holding_part is not None:
                 self._update_attachment()
             mujoco.mj_step(self.model, self.data)
+            self.contact_pairs_this_step.update(
+                (min(int(contact.geom1), int(contact.geom2)),
+                 max(int(contact.geom1), int(contact.geom2)))
+                for contact in self.data.contact[: self.data.ncon]
+            )
             if self.holding_part is not None:
                 self._update_attachment()
         self._update_task_progress()
@@ -251,7 +337,7 @@ class FactoryFloorEnv:
                 self.controller_phase = "select_part"
                 return
             self.last_pick_hover_target = self._pick_hover_target(self.active_part)
-            if self._ee_close_to_position(
+            if self._trajectory_complete() and self._ee_close_to_position(
                 self.last_pick_hover_target, self.phase_position_tol
             ):
                 self.controller_phase = "move_to_pick"
@@ -269,7 +355,7 @@ class FactoryFloorEnv:
             if self.holding_part is None:
                 self.controller_phase = "select_part"
                 return
-            if self._ee_close_to_position(
+            if self._trajectory_complete() and self._ee_close_to_position(
                 self.last_pick_hover_target, self.phase_position_tol
             ):
                 self.controller_phase = "move_to_transfer"
@@ -279,7 +365,9 @@ class FactoryFloorEnv:
             if self.holding_part is None:
                 self.controller_phase = "select_part"
                 return
-            if self._ee_close_to_position(self.transfer_target, self.phase_position_tol):
+            if self._trajectory_complete() and self._ee_close_to_position(
+                self.transfer_target, self.phase_position_tol
+            ):
                 self.controller_phase = "move_to_bin_hover"
             return
 
@@ -288,7 +376,9 @@ class FactoryFloorEnv:
                 self.controller_phase = "select_part"
                 return
             hover_target = self._bin_hover_target(self.part_specs[self.holding_part]["bin"])
-            if self._ee_close_to_position(hover_target, self.phase_position_tol):
+            if self._trajectory_complete() and self._ee_close_to_position(
+                hover_target, self.phase_position_tol
+            ):
                 self.controller_phase = "move_to_drop"
             return
 
@@ -299,7 +389,9 @@ class FactoryFloorEnv:
             return
 
         if self.controller_phase == "return_home":
-            if self._ee_close_to_position(self.home_ee_target, self.home_position_tol):
+            if self._trajectory_complete() and self._ee_close_to_position(
+                self.home_ee_target, self.home_position_tol
+            ):
                 self.controller_phase = (
                     "select_part" if self._choose_next_part() is not None else "idle"
                 )
@@ -450,6 +542,7 @@ class FactoryFloorEnv:
                 self.controller_phase == "move_to_pick"
                 and self.active_part is not None
                 and self.active_part not in self.completed_parts
+                and self._trajectory_complete()
                 and self._ee_close_to_pick(self.active_part)
             ):
                 self.holding_part = self.active_part
@@ -458,7 +551,11 @@ class FactoryFloorEnv:
             return
 
         target_bin = self.part_specs[self.holding_part]["bin"]
-        if self.controller_phase == "move_to_drop" and self._ee_ready_to_drop(target_bin):
+        if (
+            self.controller_phase == "move_to_drop"
+            and self._trajectory_complete()
+            and self._ee_ready_to_drop(target_bin)
+        ):
             self._drop_part_in_bin(self.holding_part, target_bin)
 
     def _update_attachment(self) -> None:
