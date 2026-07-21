@@ -72,7 +72,7 @@ def _peak_abs(values: np.ndarray, width: int) -> np.ndarray:
 
 
 def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
-    env = FactoryFloorEnv()
+    env = FactoryFloorEnv(enable_rgb_observation=False)
     env.random_state = np.random.default_rng(seed)
     env.reset()
     max_steps = int(np.ceil(max_seconds / env.control_dt))
@@ -133,7 +133,7 @@ def main() -> None:
     args = parser.parse_args()
 
     trials = [run_trial(seed, args.max_cycle_time) for seed in range(args.seeds)]
-    limits = FactoryFloorEnv()
+    limits = FactoryFloorEnv(enable_rgb_observation=False)
 
     def exceeds(values: list[float], bounds: np.ndarray) -> bool:
         # Small allowance covers finite-difference sampling and rounding.

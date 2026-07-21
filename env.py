@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,9 +14,23 @@ SCENE_PATH = (
 )
 
 
+def _load_model_with_policy_camera(
+    xml_path: Path, camera_name: str
+) -> mujoco.MjModel:
+    spec = mujoco.MjSpec.from_file(str(xml_path))
+    if camera_name not in {camera.name for camera in spec.cameras}:
+        spec.worldbody.add_camera(
+            name=camera_name,
+            pos=[0.56, 0.0, 1.75],
+            quat=[1.0, 0.0, 0.0, 0.0],
+            fovy=52.0,
+        )
+    return spec.compile()
+
+
 @dataclass
 class StepResult:
-    observation: np.ndarray
+    observation: dict[str, np.ndarray]
     reward: float
     terminated: bool
     truncated: bool
@@ -23,11 +38,43 @@ class StepResult:
 
 
 class FactoryFloorEnv:
-    def __init__(self, xml_path: str | Path = SCENE_PATH):
+    def __init__(
+        self,
+        xml_path: str | Path = SCENE_PATH,
+        *,
+        enable_rgb_observation: bool = True,
+        camera_name: str = "policy_camera",
+        camera_width: int = 240,
+        camera_height: int = 240,
+        rgb_render_interval: int = 1,
+    ):
         self.xml_path = Path(xml_path)
-        self.model = mujoco.MjModel.from_xml_path(str(self.xml_path))
+        self.camera_name = camera_name
+        self.model = _load_model_with_policy_camera(
+            self.xml_path, self.camera_name
+        )
         self.data = mujoco.MjData(self.model)
         self.ik_data = mujoco.MjData(self.model)
+        self.enable_rgb_observation = enable_rgb_observation
+        self.camera_width = camera_width
+        self.camera_height = camera_height
+        if rgb_render_interval < 1:
+            raise ValueError("rgb_render_interval must be at least 1")
+        self.rgb_render_interval = rgb_render_interval
+        self.rgb_frame_counter = 0
+        self.last_rgb: np.ndarray | None = None
+        self.policy_scene_option = mujoco.MjvOption()
+        mujoco.mjv_defaultOption(self.policy_scene_option)
+        self.policy_scene_option.sitegroup[:] = 0
+        self.renderer: mujoco.Renderer | None = None
+        self.camera_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name
+        )
+        if self.camera_id < 0:
+            raise ValueError(f"camera {self.camera_name!r} does not exist in the model")
+        self.base_camera_pos = self.model.cam_pos[self.camera_id].copy()
+        self.base_light_pos = self.model.light_pos.copy()
+        self.base_light_diffuse = self.model.light_diffuse.copy()
 
         self.arm_dofs = 6
         self.ctrl_low = self.model.actuator_ctrlrange[:, 0].copy()
@@ -78,60 +125,53 @@ class FactoryFloorEnv:
         self.spawn_clearance = 0.08
         self.random_state = np.random.default_rng()
 
+        # XML names remain implementation details inherited from the Menagerie
+        # workcell. Policy-facing identities are deliberately color-neutral.
         self.part_specs = {
-            "part_blue_1": {
-                "color": "blue",
-                "bin": "blue",
+            "part_0": {
                 "body": "part_blue_1",
                 "joint": "part_blue_1_free",
                 "geom": "part_blue_1_geom",
                 "support_height": 0.025,
             },
-            "part_orange_1": {
-                "color": "orange",
-                "bin": "orange",
+            "part_1": {
                 "body": "part_orange_1",
                 "joint": "part_orange_1_free",
                 "geom": "part_orange_1_geom",
                 "support_height": 0.03,
             },
-            "part_blue_2": {
-                "color": "blue",
-                "bin": "blue",
+            "part_2": {
                 "body": "part_blue_2",
                 "joint": "part_blue_2_free",
                 "geom": "part_blue_2_geom",
                 "support_height": 0.03,
             },
         }
-        self.color_encoding = {
-            "blue": np.array([1.0, 0.0], dtype=float),
-            "orange": np.array([0.0, 1.0], dtype=float),
-        }
         self.part_order = list(self.part_specs)
+        self.bin_order = ["bin_0", "bin_1"]
 
         self.ee_site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site"
         )
         self.bin_site_ids = {
-            "blue": mujoco.mj_name2id(
+            "bin_0": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_blue_target"
             ),
-            "orange": mujoco.mj_name2id(
+            "bin_1": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_target"
             ),
         }
         self.bin_approach_site_ids = {
-            "blue": mujoco.mj_name2id(
+            "bin_0": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_blue_hover"
             ),
-            "orange": mujoco.mj_name2id(
+            "bin_1": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_hover"
             ),
         }
         # The lower orange approach avoids the UR5e's upper-arm/table grazing
         # posture while retaining clearance over the bin walls.
-        self.model.site_pos[self.bin_approach_site_ids["orange"], 2] = 0.70
+        self.model.site_pos[self.bin_approach_site_ids["bin_1"], 2] = 0.70
         pedestal_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "robot_pedestal"
         )
@@ -168,6 +208,12 @@ class FactoryFloorEnv:
             )
             for name, geom_id in self.part_geom_ids.items()
         }
+        self.bin_geom_ids = {
+            "bin_0": self._body_geom_ids("blue_bin"),
+            "bin_1": self._body_geom_ids("orange_bin"),
+        }
+        self.bin_colors: dict[str, np.ndarray] = {}
+        self.part_colors: dict[str, np.ndarray] = {}
 
         mujoco.mj_resetData(self.model, self.data)
         self._set_robot_configuration(self.home_ctrl)
@@ -187,13 +233,138 @@ class FactoryFloorEnv:
         self.trajectory_duration = self.min_trajectory_duration
         self.contact_pairs_this_step: set[tuple[int, int]] = set()
 
+        if self.enable_rgb_observation:
+            self.renderer = mujoco.Renderer(
+                self.model,
+                height=self.camera_height,
+                width=self.camera_width,
+            )
+
         self.reset()
 
-    def reset(self) -> tuple[np.ndarray, dict]:
+    def _body_geom_ids(self, body_name: str) -> list[int]:
+        body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, body_name
+        )
+        first_geom = int(self.model.body_geomadr[body_id])
+        geom_count = int(self.model.body_geomnum[body_id])
+        return list(range(first_geom, first_geom + geom_count))
+
+    def _sample_distinct_colors(self) -> list[np.ndarray]:
+        first_hue = float(self.random_state.uniform(0.0, 1.0))
+        hue_separation = float(self.random_state.uniform(0.28, 0.50))
+        hues = [first_hue, (first_hue + hue_separation) % 1.0]
+        colors = []
+        for hue in hues:
+            saturation = float(self.random_state.uniform(0.72, 0.95))
+            value = float(self.random_state.uniform(0.72, 0.95))
+            rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+            colors.append(np.array([*rgb, 1.0], dtype=float))
+        return colors
+
+    def _set_geom_color(self, geom_ids: list[int], color: np.ndarray) -> None:
+        for geom_id in geom_ids:
+            # Removing the material binding lets each geom receive its own
+            # per-episode color instead of sharing the legacy named material.
+            self.model.geom_matid[geom_id] = -1
+            self.model.geom_rgba[geom_id] = color
+
+    def _randomize_visual_task(self) -> None:
+        self.model.cam_pos[self.camera_id] = self.base_camera_pos + self.random_state.uniform(
+            [-0.015, -0.015, -0.02], [0.015, 0.015, 0.02]
+        )
+        if self.model.nlight:
+            self.model.light_pos[:] = self.base_light_pos + self.random_state.uniform(
+                -0.08, 0.08, self.base_light_pos.shape
+            )
+            light_scale = self.random_state.uniform(
+                0.78, 1.18, (self.model.nlight, 1)
+            )
+            self.model.light_diffuse[:] = np.clip(
+                self.base_light_diffuse * light_scale, 0.0, 1.0
+            )
+
+        colors = self._sample_distinct_colors()
+        self.bin_colors = {
+            bin_name: colors[index].copy()
+            for index, bin_name in enumerate(self.bin_order)
+        }
+        for bin_name in self.bin_order:
+            self._set_geom_color(self.bin_geom_ids[bin_name], self.bin_colors[bin_name])
+
+        # Both bins receive at least one part. The remaining part and ordering
+        # are sampled, so geometry names never imply a destination.
+        assignments = self.bin_order.copy()
+        assignments.append(
+            self.bin_order[int(self.random_state.integers(len(self.bin_order)))]
+        )
+        self.random_state.shuffle(assignments)
+        self.part_colors = {}
+        for part_name, target_bin in zip(self.part_order, assignments, strict=True):
+            match_id = self.bin_order.index(target_bin)
+            self.part_specs[part_name]["match_id"] = match_id
+            self.part_specs[part_name]["target_bin"] = target_bin
+            color = self.bin_colors[target_bin].copy()
+            self.part_colors[part_name] = color
+            self._set_geom_color([self.part_geom_ids[part_name]], color)
+
+    def render_rgb(self) -> np.ndarray:
+        if self.renderer is None:
+            raise RuntimeError("RGB observations are disabled for this environment")
+        self.renderer.update_scene(
+            self.data,
+            camera=self.camera_name,
+            scene_option=self.policy_scene_option,
+        )
+        return self.renderer.render().copy()
+
+    def render_segmentation(self) -> np.ndarray:
+        """Render privileged geom IDs for automatic dataset supervision."""
+        if self.renderer is None:
+            raise RuntimeError("RGB observations are disabled for this environment")
+        self.renderer.enable_segmentation_rendering()
+        try:
+            self.renderer.update_scene(
+                self.data,
+                camera=self.camera_name,
+                scene_option=self.policy_scene_option,
+            )
+            return self.renderer.render().copy()
+        finally:
+            self.renderer.disable_segmentation_rendering()
+
+    def oracle_task_state(self) -> dict:
+        """Privileged matching state for dataset labels and evaluation only."""
+        return {
+            "part_to_bin": {
+                name: self.part_specs[name]["target_bin"]
+                for name in self.part_order
+            },
+            "match_ids": {
+                name: int(self.part_specs[name]["match_id"])
+                for name in self.part_order
+            },
+            "bin_colors_rgba": {
+                name: self.bin_colors[name].copy()
+                for name in self.bin_order
+            },
+            "part_colors_rgba": {
+                name: self.part_colors[name].copy()
+                for name in self.part_order
+            },
+        }
+
+    def close(self) -> None:
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
+
+    def reset(self) -> tuple[dict[str, np.ndarray], dict]:
         mujoco.mj_resetData(self.model, self.data)
         self._set_robot_configuration(self.home_ctrl)
         for name in self.part_order:
             self._set_part_collision_enabled(name, enabled=True)
+        self._randomize_visual_task()
         self._randomize_part_layout()
         mujoco.mj_forward(self.model, self.data)
         self.holding_part = None
@@ -202,6 +373,8 @@ class FactoryFloorEnv:
         self.controller_phase = "select_part"
         self.last_pick_hover_target = self.home_ee_target.copy()
         self._reset_joint_trajectory()
+        self.rgb_frame_counter = 0
+        self.last_rgb = None
         return self._get_observation(), self._get_info()
 
     def step(self, action: np.ndarray) -> StepResult:
@@ -375,7 +548,9 @@ class FactoryFloorEnv:
             if self.holding_part is None:
                 self.controller_phase = "select_part"
                 return
-            hover_target = self._bin_hover_target(self.part_specs[self.holding_part]["bin"])
+            hover_target = self._bin_hover_target(
+                self.part_specs[self.holding_part]["target_bin"]
+            )
             if self._trajectory_complete() and self._ee_close_to_position(
                 hover_target, self.phase_position_tol
             ):
@@ -416,7 +591,7 @@ class FactoryFloorEnv:
         if part_name is None:
             return self.home_ee_target
 
-        target_bin = self.part_specs[part_name]["bin"]
+        target_bin = self.part_specs[part_name]["target_bin"]
         if self.controller_phase == "move_to_bin_hover":
             return self._bin_hover_target(target_bin)
         if self.controller_phase == "move_to_drop":
@@ -550,7 +725,7 @@ class FactoryFloorEnv:
                 self._update_attachment()
             return
 
-        target_bin = self.part_specs[self.holding_part]["bin"]
+        target_bin = self.part_specs[self.holding_part]["target_bin"]
         if (
             self.controller_phase == "move_to_drop"
             and self._trajectory_complete()
@@ -588,7 +763,7 @@ class FactoryFloorEnv:
         stacked = sum(
             1
             for name in self.completed_parts
-            if self.part_specs[name]["bin"] == bin_name
+            if self.part_specs[name]["target_bin"] == bin_name
         )
         target_qpos = np.array(
             [
@@ -630,45 +805,41 @@ class FactoryFloorEnv:
         reward = 0.0
         for name, spec in self.part_specs.items():
             body_pos = self.data.xpos[self.part_body_ids[name]]
-            target_pos = self.data.site_xpos[self.bin_site_ids[spec["bin"]]]
+            target_pos = self.data.site_xpos[
+                self.bin_site_ids[spec["target_bin"]]
+            ]
             reward -= float(np.linalg.norm(body_pos - target_pos))
         return reward
 
     def _part_state(self, name: str) -> dict:
-        spec = self.part_specs[name]
         spawn_qpos = self.spawn_layout.get(name, self._read_freejoint_qpos(name))
         return {
-            "color": spec["color"],
-            "target_bin": spec["bin"],
             "spawn_position": spawn_qpos[:3].round(4).tolist(),
             "current_position": self.data.xpos[self.part_body_ids[name]].round(4).tolist(),
             "holding": name == self.holding_part,
             "sorted": name in self.completed_parts,
         }
 
-    def _get_observation(self) -> np.ndarray:
-        bin_features = np.concatenate(
+    def _get_observation(self) -> dict[str, np.ndarray]:
+        # Part coordinates, match IDs, target bins, and simulator colors are
+        # intentionally excluded. A learned policy must infer them from RGB.
+        proprioception = np.concatenate(
             [
-                self.data.site_xpos[self.bin_site_ids[name]].copy()
-                for name in ("blue", "orange")
-            ]
-        )
-        part_features = []
-        for name in self.part_order:
-            spec = self.part_specs[name]
-            part_features.extend(self.data.xpos[self.part_body_ids[name]].tolist())
-            part_features.extend(self.color_encoding[spec["color"]].tolist())
-            part_features.append(float(name == self.holding_part))
-            part_features.append(float(name in self.completed_parts))
-        return np.concatenate(
-            [
-                self.data.qpos.copy(),
-                self.data.qvel.copy(),
+                self.data.qpos[: self.arm_dofs].copy(),
+                self.data.qvel[: self.arm_dofs].copy(),
                 self.data.site_xpos[self.ee_site_id].copy(),
-                bin_features,
-                np.array(part_features, dtype=float),
             ]
-        )
+        ).astype(np.float32)
+        observation = {"proprioception": proprioception}
+        if self.renderer is not None:
+            if (
+                self.last_rgb is None
+                or self.rgb_frame_counter % self.rgb_render_interval == 0
+            ):
+                self.last_rgb = self.render_rgb()
+            observation["rgb"] = self.last_rgb.copy()
+            self.rgb_frame_counter += 1
+        return observation
 
     def _get_info(self) -> dict:
         return {
@@ -685,7 +856,7 @@ class FactoryFloorEnv:
         }
 
     def _sorted_counts(self) -> dict[str, int]:
-        counts = {"blue": 0, "orange": 0}
+        counts = {bin_name: 0 for bin_name in self.bin_order}
         for name in self.completed_parts:
-            counts[self.part_specs[name]["bin"]] += 1
+            counts[self.part_specs[name]["target_bin"]] += 1
         return counts

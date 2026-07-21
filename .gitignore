@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 third_party/
 IK_SORTER_NOTES.md
+datasets/
+/docs
