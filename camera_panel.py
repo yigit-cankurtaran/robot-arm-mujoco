@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import signal
 from typing import Any
 
 import numpy as np
@@ -42,6 +43,11 @@ def _camera_worker(
     error_queue: Any,
     scale: int,
 ) -> None:
+    # Ctrl+C belongs to the parent process.  If the child handles it too, it can
+    # be interrupted halfway through Queue.get()/Cocoa cleanup while the parent
+    # is trying to join it, leaving multiprocessing resources alive.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     # This import and all Cocoa calls intentionally live in the child process.
     import cv2
 
@@ -102,7 +108,14 @@ class CameraPanelProcess:
         self.started = False
 
     def start(self, timeout: float = 5.0) -> str | None:
-        self.process.start()
+        # A spawned interpreter imports the main module before entering
+        # _camera_worker().  Inherit SIG_IGN across that bootstrap too, then
+        # immediately restore the parent's normal Ctrl+C handling.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            self.process.start()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
         self.started = True
         if not self.ready_event.wait(timeout):
             return "camera process did not initialize within five seconds"
@@ -136,15 +149,29 @@ class CameraPanelProcess:
     def close(self) -> None:
         if not self.started:
             return
+        # Make cleanup idempotent before any operation that could itself fail.
+        self.started = False
         self.close_event.set()
         try:
             self.frame_queue.put_nowait(None)
         except queue.Full:
             pass
-        self.process.join(timeout=2.0)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=1.0)
-        self.frame_queue.close()
-        self.error_queue.close()
-        self.started = False
+
+        try:
+            self.process.join(timeout=2.0)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1.0)
+            if self.process.is_alive():
+                # A Cocoa event loop can occasionally ignore SIGTERM while it
+                # is inside native code.  Do not let that child outlive the
+                # demo; SIGKILL is the final, bounded fallback.
+                self.process.kill()
+                self.process.join(timeout=1.0)
+        finally:
+            # multiprocessing Queue owns a feeder thread.  Waiting for that
+            # thread at interpreter shutdown can keep Python alive after both
+            # windows have gone away, especially when frames remain buffered.
+            for transport_queue in (self.frame_queue, self.error_queue):
+                transport_queue.cancel_join_thread()
+                transport_queue.close()

@@ -22,15 +22,15 @@ def main() -> None:
     # controller enough rendering headroom for a smooth interactive demo.
     env = FactoryFloorEnv(rgb_render_interval=2)
     camera_panel = None if args.no_camera_panel else CameraPanelProcess()
-    if camera_panel is not None:
-        startup_error = camera_panel.start()
-        if startup_error is not None:
-            print(f"Camera panel disabled: {startup_error}")
-            camera_panel.close()
-            camera_panel = None
-
-    print(env.describe_task())
     try:
+        if camera_panel is not None:
+            startup_error = camera_panel.start()
+            if startup_error is not None:
+                print(f"Camera panel disabled: {startup_error}")
+                camera_panel.close()
+                camera_panel = None
+
+        print(env.describe_task())
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.cam.azimuth = 138
             viewer.cam.elevation = -24
@@ -55,6 +55,8 @@ def main() -> None:
                 remaining = env.control_dt - (time.perf_counter() - start)
                 if remaining > 0:
                     time.sleep(remaining)
+    except KeyboardInterrupt:
+        print("Stopping demo...")
     finally:
         if camera_panel is not None:
             camera_panel.close()

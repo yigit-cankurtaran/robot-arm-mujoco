@@ -51,21 +51,24 @@ def main() -> None:
     args = parser.parse_args()
 
     env = FactoryFloorEnv(rgb_render_interval=2)
-    policy = RGBVisualPolicy(args.checkpoint, device=args.device)
-    initial_rgb = env.render_rgb()
-    estimate, commands = validated_commands(policy, initial_rgb)
-    diagnostics = env.set_visual_targets(commands)
-    print({"visual_policy": diagnostics})
-    overlay = draw_task_estimate(initial_rgb, estimate)
-
-    camera_panel = None if args.no_camera_panel else CameraPanelProcess()
-    if camera_panel is not None:
-        startup_error = camera_panel.start()
-        if startup_error is not None:
-            print(f"Camera panel disabled: {startup_error}")
-            camera_panel.close()
-            camera_panel = None
+    camera_panel = None
     try:
+        policy = RGBVisualPolicy(args.checkpoint, device=args.device)
+        initial_rgb = env.render_rgb()
+        estimate, commands = validated_commands(policy, initial_rgb)
+        diagnostics = env.set_visual_targets(commands)
+        print({"visual_policy": diagnostics})
+        overlay = draw_task_estimate(initial_rgb, estimate)
+
+        if not args.no_camera_panel:
+            camera_panel = CameraPanelProcess()
+        if camera_panel is not None:
+            startup_error = camera_panel.start()
+            if startup_error is not None:
+                print(f"Camera panel disabled: {startup_error}")
+                camera_panel.close()
+                camera_panel = None
+
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.cam.azimuth = 138
             viewer.cam.elevation = -24
@@ -108,6 +111,8 @@ def main() -> None:
                 remaining = env.control_dt - (time.perf_counter() - started)
                 if remaining > 0:
                     time.sleep(remaining)
+    except KeyboardInterrupt:
+        print("Stopping visual sorting demo...")
     finally:
         if camera_panel is not None:
             camera_panel.close()
