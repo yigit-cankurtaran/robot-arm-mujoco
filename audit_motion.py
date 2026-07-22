@@ -4,10 +4,10 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 
-import mujoco
 import numpy as np
 
 from env import FactoryFloorEnv
+from safety_monitor import unsafe_contact_events
 
 
 @dataclass
@@ -25,73 +25,8 @@ class TrialMetrics:
     peak_tracking_error: list[float]
 
 
-def _body_descends_from(model: mujoco.MjModel, body_id: int, root_id: int) -> bool:
-    while body_id > 0:
-        if body_id == root_id:
-            return True
-        body_id = int(model.body_parentid[body_id])
-    return False
-
-
-def _contact_label(env: FactoryFloorEnv, geom_id: int) -> str:
-    geom_name = env.model.geom(geom_id).name
-    if geom_name:
-        return geom_name
-    body_id = int(env.model.geom_bodyid[geom_id])
-    return f"{env.model.body(body_id).name}:collision"
-
-
 def _unsafe_contact_pairs(env: FactoryFloorEnv) -> list[str]:
-    robot_root = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "base")
-    gripper_root = mujoco.mj_name2id(
-        env.model, mujoco.mjtObj.mjOBJ_BODY, "gripper/base_mount"
-    )
-    pairs: list[str] = []
-    for geom1, geom2 in env.contact_pairs_this_step:
-        body1 = int(env.model.geom_bodyid[geom1])
-        body2 = int(env.model.geom_bodyid[geom2])
-        robot1 = _body_descends_from(env.model, body1, robot_root)
-        robot2 = _body_descends_from(env.model, body2, robot_root)
-
-        # Part/table, part/bin, and part/part contacts are expected task physics.
-        # Opposing gripper-pad contact with the selected/held part is the physical
-        # grasp and is expected too. Other robot/workcell contacts remain unsafe.
-        unsafe = robot1 != robot2
-        if robot1 != robot2:
-            robot_geom = geom1 if robot1 else geom2
-            external_geom = geom2 if robot1 else geom1
-            grasp_part = env.holding_part or (
-                env.active_part
-                if env.controller_phase in {"move_to_pick", "close_gripper"}
-                else env.released_part
-                if env.controller_phase == "open_gripper"
-                else None
-            )
-            if grasp_part is not None:
-                robot_body = int(env.model.geom_bodyid[robot_geom])
-                gripper_contact = _body_descends_from(
-                    env.model, robot_body, gripper_root
-                )
-                if (
-                    gripper_contact
-                    and external_geom == env.part_geom_ids[grasp_part]
-                ):
-                    unsafe = False
-        if robot1 and robot2 and body1 != body2:
-            unsafe = int(env.model.body_parentid[body1]) != body2 and int(
-                env.model.body_parentid[body2]
-            ) != body1
-            # Closed 2F-85 pads and linkage contacts are internal to the
-            # upstream gripper model and are not arm self-collisions.
-            if _body_descends_from(
-                env.model, body1, gripper_root
-            ) and _body_descends_from(env.model, body2, gripper_root):
-                unsafe = False
-        if unsafe:
-            pairs.append(
-                f"{_contact_label(env, geom1)} <-> {_contact_label(env, geom2)}"
-            )
-    return pairs
+    return [contact.pair for contact in unsafe_contact_events(env)]
 
 
 def _peak_abs(values: np.ndarray, width: int) -> np.ndarray:

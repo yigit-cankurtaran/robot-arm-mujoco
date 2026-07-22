@@ -8,6 +8,11 @@ import mujoco.viewer
 from camera_panel import CameraPanelProcess
 from demo_runtime import sort_is_complete, sort_success_message
 from env import FactoryFloorEnv
+from safety_monitor import (
+    detect_safety_failure,
+    safety_failure_message,
+    write_safety_failure,
+)
 
 
 def main() -> None:
@@ -41,6 +46,8 @@ def main() -> None:
             while viewer.is_running():
                 start = time.perf_counter()
                 result = env.scripted_step()
+                wall_seconds = time.perf_counter() - run_started
+                failure = detect_safety_failure(env, wall_seconds)
                 viewer.sync()
                 if camera_panel is not None:
                     if camera_panel.user_requested_close():
@@ -54,10 +61,14 @@ def main() -> None:
                         camera_panel.publish(
                             result.observation["rgb"], env.controller_phase
                         )
+                if failure is not None:
+                    log_path = write_safety_failure(failure)
+                    print(safety_failure_message(failure, log_path))
+                    break
                 if sort_is_complete(env):
                     print(
                         sort_success_message(
-                            env, time.perf_counter() - run_started
+                            env, wall_seconds
                         )
                     )
                     break

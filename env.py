@@ -49,6 +49,17 @@ class StepResult:
     info: dict
 
 
+@dataclass(frozen=True)
+class ContactEvent:
+    geom1: int
+    geom2: int
+    distance: float
+    position: tuple[float, float, float]
+    simulated_time: float
+    controller_phase: str
+    expected_part_geom_id: int | None
+
+
 class FactoryFloorEnv:
     def __init__(
         self,
@@ -385,6 +396,7 @@ class FactoryFloorEnv:
         self.trajectory_elapsed = 0.0
         self.trajectory_duration = self.min_trajectory_duration
         self.contact_pairs_this_step: set[tuple[int, int]] = set()
+        self.contact_events_this_step: list[ContactEvent] = []
         self.visual_targets: dict[str, dict[str, np.ndarray | str]] | None = None
 
         if self.enable_rgb_observation:
@@ -775,11 +787,36 @@ class FactoryFloorEnv:
         adhesion_control = float(self._gripper_control_target() > 0.0)
         self.data.ctrl[self.gripper_adhesion_actuator_ids] = adhesion_control
         self.contact_pairs_this_step.clear()
+        self.contact_events_this_step.clear()
         for _ in range(self.control_substeps):
             mujoco.mj_step(self.model, self.data)
+            expected_part = self.holding_part or (
+                self.active_part
+                if self.controller_phase in {"move_to_pick", "close_gripper"}
+                else self.released_part
+                if self.controller_phase == "open_gripper"
+                else None
+            )
+            expected_part_geom_id = (
+                self.part_geom_ids[expected_part]
+                if expected_part is not None
+                else None
+            )
             self.contact_pairs_this_step.update(
                 (min(int(contact.geom1), int(contact.geom2)),
                  max(int(contact.geom1), int(contact.geom2)))
+                for contact in self.data.contact[: self.data.ncon]
+            )
+            self.contact_events_this_step.extend(
+                ContactEvent(
+                    geom1=int(contact.geom1),
+                    geom2=int(contact.geom2),
+                    distance=float(contact.dist),
+                    position=tuple(float(value) for value in contact.pos),
+                    simulated_time=float(self.data.time),
+                    controller_phase=self.controller_phase,
+                    expected_part_geom_id=expected_part_geom_id,
+                )
                 for contact in self.data.contact[: self.data.ncon]
             )
         if self.controller_phase == "close_gripper":

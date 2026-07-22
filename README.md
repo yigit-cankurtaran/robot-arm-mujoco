@@ -36,6 +36,14 @@ After the final object settles in its bin, the arm returns fully home, prints a
 success line with object count, simulated time, wall time, and throughput, then
 closes both windows and the camera child process automatically.
 
+If an arm or gripper collision geom touches the table, a bin, the camera
+support, an unrelated object, or a non-adjacent robot link, the demo stops on
+that physics tick instead. It prints the contact pair, phase, simulated time,
+and world-space contact point, then writes the complete joint/task snapshot to
+`runs/safety_failures/contact_failure_<UTC timestamp>.json` before cleanup.
+Normal fingertip contact with the selected object and internal gripper contacts
+are intentionally excluded.
+
 To test only the isolated camera process for three seconds:
 
 ```bash

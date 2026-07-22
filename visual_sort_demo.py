@@ -9,6 +9,11 @@ import mujoco.viewer
 from camera_panel import CameraPanelProcess
 from demo_runtime import sort_is_complete, sort_success_message
 from env import FactoryFloorEnv
+from safety_monitor import (
+    detect_safety_failure,
+    safety_failure_message,
+    write_safety_failure,
+)
 from visual_policy import RGBVisualPolicy, draw_task_estimate
 
 
@@ -79,11 +84,13 @@ def main() -> None:
             while viewer.is_running():
                 started = time.perf_counter()
                 result = env.scripted_step()
+                wall_seconds = time.perf_counter() - run_started
+                failure = detect_safety_failure(env, wall_seconds)
                 completed = sort_is_complete(env)
                 rendered_this_tick = (
                     (env.rgb_frame_counter - 1) % env.rgb_render_interval == 0
                 )
-                if rendered_this_tick and not completed:
+                if rendered_this_tick and not completed and failure is None:
                     live_estimate = policy.predict(result.observation["rgb"])
                     overlay = draw_task_estimate(
                         result.observation["rgb"], live_estimate
@@ -111,10 +118,14 @@ def main() -> None:
                         camera_panel = None
                     else:
                         camera_panel.publish(overlay, env.controller_phase)
+                if failure is not None:
+                    log_path = write_safety_failure(failure)
+                    print(safety_failure_message(failure, log_path))
+                    break
                 if completed:
                     print(
                         sort_success_message(
-                            env, time.perf_counter() - run_started
+                            env, wall_seconds
                         )
                     )
                     break
