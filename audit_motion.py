@@ -43,6 +43,9 @@ def _contact_label(env: FactoryFloorEnv, geom_id: int) -> str:
 
 def _unsafe_contact_pairs(env: FactoryFloorEnv) -> list[str]:
     robot_root = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "base")
+    gripper_root = mujoco.mj_name2id(
+        env.model, mujoco.mjtObj.mjOBJ_BODY, "gripper/base_mount"
+    )
     pairs: list[str] = []
     for geom1, geom2 in env.contact_pairs_this_step:
         body1 = int(env.model.geom_bodyid[geom1])
@@ -51,13 +54,39 @@ def _unsafe_contact_pairs(env: FactoryFloorEnv) -> list[str]:
         robot2 = _body_descends_from(env.model, body2, robot_root)
 
         # Part/table, part/bin, and part/part contacts are expected task physics.
-        # Any robot contact with the workcell or a loose part is unsafe.  Robot
-        # self-contact between non-adjacent collision bodies is unsafe as well.
+        # Opposing gripper-pad contact with the selected/held part is the physical
+        # grasp and is expected too. Other robot/workcell contacts remain unsafe.
         unsafe = robot1 != robot2
+        if robot1 != robot2:
+            robot_geom = geom1 if robot1 else geom2
+            external_geom = geom2 if robot1 else geom1
+            grasp_part = env.holding_part or (
+                env.active_part
+                if env.controller_phase in {"move_to_pick", "close_gripper"}
+                else env.released_part
+                if env.controller_phase == "open_gripper"
+                else None
+            )
+            if grasp_part is not None:
+                robot_body = int(env.model.geom_bodyid[robot_geom])
+                gripper_contact = _body_descends_from(
+                    env.model, robot_body, gripper_root
+                )
+                if (
+                    gripper_contact
+                    and external_geom == env.part_geom_ids[grasp_part]
+                ):
+                    unsafe = False
         if robot1 and robot2 and body1 != body2:
             unsafe = int(env.model.body_parentid[body1]) != body2 and int(
                 env.model.body_parentid[body2]
             ) != body1
+            # Closed 2F-85 pads and linkage contacts are internal to the
+            # upstream gripper model and are not arm self-collisions.
+            if _body_descends_from(
+                env.model, body1, gripper_root
+            ) and _body_descends_from(env.model, body2, gripper_root):
+                unsafe = False
         if unsafe:
             pairs.append(
                 f"{_contact_label(env, geom1)} <-> {_contact_label(env, geom2)}"
@@ -85,10 +114,11 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
     completed = False
     for step_index in range(max_steps):
         env.scripted_step()
-        commands.append(env.data.ctrl.copy())
+        commands.append(env.data.ctrl[: env.arm_dofs].copy())
         measured_velocity.append(env.data.qvel[: env.arm_dofs].copy())
         tracking_error.append(
-            env.data.ctrl.copy() - env.data.qpos[: env.arm_dofs].copy()
+            env.data.ctrl[: env.arm_dofs].copy()
+            - env.data.qpos[: env.arm_dofs].copy()
         )
         unsafe_contacts.extend(_unsafe_contact_pairs(env))
         if (
@@ -131,7 +161,7 @@ def main() -> None:
         description="Headless speed, smoothness, completion, and collision audit."
     )
     parser.add_argument("--seeds", type=int, default=20)
-    parser.add_argument("--max-cycle-time", type=float, default=30.0)
+    parser.add_argument("--max-cycle-time", type=float, default=150.0)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 

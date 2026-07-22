@@ -12,12 +12,24 @@ ROOT = Path(__file__).resolve().parent
 SCENE_PATH = (
     ROOT / "third_party" / "menagerie" / "universal_robots_ur5e" / "workcell_scene.xml"
 )
+GRIPPER_PATH = ROOT / "third_party" / "menagerie" / "robotiq_2f85" / "2f85.xml"
 
 
 def _load_model_with_policy_camera(
     xml_path: Path, camera_name: str
 ) -> mujoco.MjModel:
     spec = mujoco.MjSpec.from_file(str(xml_path))
+    gripper_spec = mujoco.MjSpec.from_file(str(GRIPPER_PATH))
+    attachment_site = spec.site("attachment_site")
+    if attachment_site is None:
+        raise ValueError("robot model does not define attachment_site")
+    attachment_site.attach_body(
+        gripper_spec.body("base_mount"), prefix="gripper/"
+    )
+    # The upstream 2F-85 model is tuned for elliptic friction cones and a high
+    # tangential-to-normal contact impedance ratio.
+    spec.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
+    spec.option.impratio = 10.0
     if camera_name not in {camera.name for camera in spec.cameras}:
         spec.worldbody.add_camera(
             name=camera_name,
@@ -94,11 +106,17 @@ class FactoryFloorEnv:
         self.base_light_diffuse = self.model.light_diffuse.copy()
 
         self.arm_dofs = 6
-        self.ctrl_low = self.model.actuator_ctrlrange[:, 0].copy()
-        self.ctrl_high = self.model.actuator_ctrlrange[:, 1].copy()
+        self.ctrl_low = self.model.actuator_ctrlrange[: self.arm_dofs, 0].copy()
+        self.ctrl_high = self.model.actuator_ctrlrange[: self.arm_dofs, 1].copy()
         self.control_substeps = 10
         self.control_dt = self.model.opt.timestep * self.control_substeps
-        self.home_ctrl = np.array([-3.25, -1.72, 1.48, -1.72, -3.05, 0.0], dtype=float)
+        # Downward-facing, table-clear IK branch for the physically attached
+        # Robotiq gripper.  Equivalent wrapped joint solutions exist, but this
+        # one was selected by collision audit and has good workspace coverage.
+        self.home_ctrl = np.array(
+            [-3.56075, -1.79627, 1.23290, -1.73263, 4.06687, -2.54526],
+            dtype=float,
+        )
 
         # Per-joint limits for the commanded minimum-jerk trajectories.  These are
         # deliberately below the UR5e hardware limits while being considerably
@@ -112,6 +130,9 @@ class FactoryFloorEnv:
         self.max_joint_jerk = np.array(
             [55.0, 55.0, 65.0, 80.0, 80.0, 80.0], dtype=float
         )
+        # Discrete 50 Hz commands and phase boundaries need margin below the
+        # continuous minimum-jerk polynomial's analytical peak.
+        self.trajectory_jerk_margin = 0.55
         self.min_trajectory_duration = 0.24
 
         self.ik_iterations = 32
@@ -121,44 +142,59 @@ class FactoryFloorEnv:
         self.ik_tolerance = 0.002
         self.ik_max_update = 0.35
 
-        # Position-only IK treats wrist orientation as an independent tool
-        # servo. The visible fixed-length gripper rotates between audited pick
-        # and bin vectors while its base follows the UR attachment site.
-        self.gripper_bin_vector = np.array([0.20, 0.15, -0.10], dtype=float)
-        self.gripper_length = float(np.linalg.norm(self.gripper_bin_vector))
-        raw_pick_vector = np.array([0.05, -0.16, -0.125], dtype=float)
-        self.gripper_pick_vector = (
-            self.gripper_length
-            * raw_pick_vector
-            / float(np.linalg.norm(raw_pick_vector))
+        # The pinch site is position-and-axis controlled. These audited approach
+        # directions keep the bulky wrist inboard while the shorter physical
+        # fingers reach the tabletop and randomized bins. Rotation about the
+        # gripper axis remains free, avoiding an unnecessary IK constraint.
+        raw_pick_direction = np.array([0.05, -0.16, -0.125], dtype=float)
+        self.gripper_pick_direction = raw_pick_direction / np.linalg.norm(
+            raw_pick_direction
         )
-        self.pick_offset = -self.gripper_pick_vector
-        self.pick_hover_offset = self.pick_offset + np.array(
-            [0.0, 0.0, 0.08], dtype=float
+        raw_bin_direction = np.array([0.628, 0.736, -0.254], dtype=float)
+        self.gripper_bin_direction = raw_bin_direction / np.linalg.norm(
+            raw_bin_direction
         )
-        self.transfer_target = np.array([0.45, 0.0, 0.90], dtype=float)
+        self.pick_hover_height = 0.16
+        self.low_profile_grasp_height = 0.028
+        self.grasp_table_clearance = 0.006
+        self.max_grasp_center_offset = 0.018
+        self.transfer_target = np.array([0.45, 0.0, 0.82], dtype=float)
+        self.bin_ik_seed = np.array(
+            [-0.0324, -1.3677, -1.0930, -1.1547, 2.1906, -3.4311],
+            dtype=float,
+        )
+        self.bin_approach_ik_seed = np.array(
+            [-0.0324, -1.3677, -1.0930, -1.1547, 2.1906, -3.4311],
+            dtype=float,
+        )
         self.home_position_tol = 0.06
-        self.phase_position_tol = 0.05
+        self.phase_position_tol = 0.025
         self.drop_release_xy_tol = 0.05
         self.drop_release_z_tol = 0.05
-        self.drop_hover_height = 0.86
-        self.drop_release_height = 0.82
+        self.drop_hover_height = 0.76
+        self.drop_release_height = 0.69
         self.drop_settle_duration = 0.55
-        self.drop_settle_timeout = 1.50
+        self.drop_settle_timeout = 3.00
+        self.grasp_close_duration = 0.70
+        self.grasp_settle_duration = 0.20
+        self.grasp_loss_timeout = 0.08
+        self.gripper_open_ctrl = 0.0
+        self.gripper_close_ctrl = 255.0
+        self.gripper_release_duration = 0.20
         self.bin_inner_half_width = 0.085
 
         self.table_surface_z = 0.49
-        self.spawn_surface_z = 0.52
+        self.spawn_surface_z = self.table_surface_z
         self.spawn_anchors = [
-            np.array([0.28, -0.25], dtype=float),
-            np.array([0.38, -0.25], dtype=float),
-            np.array([0.48, -0.25], dtype=float),
-            np.array([0.28, -0.35], dtype=float),
-            np.array([0.38, -0.35], dtype=float),
-            np.array([0.48, -0.35], dtype=float),
+            np.array([0.25, -0.22], dtype=float),
+            np.array([0.385, -0.22], dtype=float),
+            np.array([0.52, -0.22], dtype=float),
+            np.array([0.25, -0.36], dtype=float),
+            np.array([0.385, -0.36], dtype=float),
+            np.array([0.52, -0.36], dtype=float),
         ]
-        self.spawn_jitter = np.array([0.008, 0.008], dtype=float)
-        self.spawn_clearance = 0.075
+        self.spawn_jitter = np.array([0.004, 0.004], dtype=float)
+        self.spawn_clearance = 0.115
         self.random_state = np.random.default_rng()
 
         # XML names remain implementation details inherited from the Menagerie
@@ -217,13 +253,41 @@ class FactoryFloorEnv:
         self.active_part_order = self.part_order.copy()
         self.bin_order = ["bin_0", "bin_1"]
 
-        self.ee_site_id = mujoco.mj_name2id(
+        self.flange_site_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site"
         )
-        gripper_body_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "simple_gripper_tool"
+        self.ee_site_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_SITE, "gripper/pinch"
         )
-        self.gripper_mocap_id = int(self.model.body_mocapid[gripper_body_id])
+        self.gripper_actuator_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "gripper/fingers_actuator"
+        )
+        self.gripper_adhesion_actuator_ids = [
+            mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_ACTUATOR,
+                f"gripper/{side}_pad_adhesion",
+            )
+            for side in ("right", "left")
+        ]
+        self.gripper_pad_geom_ids = {
+            "right": {
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM, "gripper/right_pad1"
+                ),
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM, "gripper/right_pad2"
+                ),
+            },
+            "left": {
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM, "gripper/left_pad1"
+                ),
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM, "gripper/left_pad2"
+                ),
+            },
+        }
         self.bin_site_ids = {
             "bin_0": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_blue_target"
@@ -303,10 +367,12 @@ class FactoryFloorEnv:
         self.home_ee_target = self.data.site_xpos[self.ee_site_id].copy()
 
         self.holding_part: str | None = None
-        self.current_gripper_vector = self.gripper_pick_vector.copy()
         self.released_part: str | None = None
         self.released_target_bin: str | None = None
         self.drop_settle_elapsed = 0.0
+        self.grasp_elapsed = 0.0
+        self.grasp_lost_elapsed = 0.0
+        self.gripper_phase_elapsed = 0.0
         self.active_part: str | None = None
         self.completed_parts: set[str] = set()
         self.controller_phase = "idle"
@@ -426,21 +492,22 @@ class FactoryFloorEnv:
         for name, body_id in self.bin_body_ids.items():
             self.model.body_pos[body_id] = self.base_bin_body_pos[name]
         if self.randomize_bin_positions:
-            # Sample across the far table bands. Bin walls remain inside the
-            # tabletop, clear of the feed tray, visible, and inside the UR5e's
-            # audited approach corridor.
-            lower_image_center = self.random_state.uniform(
-                [0.62, 0.10], [0.70, 0.16]
-            )
-            upper_image_center = self.random_state.uniform(
-                [0.62, 0.40], [0.70, 0.46]
-            )
-            self.model.body_pos[self.bin_body_ids["bin_0"], :2] += (
-                lower_image_center - np.array([0.70, 0.26])
-            )
-            self.model.body_pos[self.bin_body_ids["bin_1"], :2] += (
-                upper_image_center - np.array([0.70, -0.26])
-            )
+            # These are world-space centers, not body translations. Both bands
+            # are inside the collision-audited UR5e corridor and remain at
+            # least one bin width apart. Farther positive-Y placements are
+            # position-reachable but drive the upper arm through the tabletop.
+            centers = {
+                "bin_0": self.random_state.uniform([0.40, 0.28], [0.46, 0.36]),
+                "bin_1": self.random_state.uniform([0.60, 0.04], [0.66, 0.10]),
+            }
+            nominal_centers = {
+                "bin_0": np.array([0.70, 0.26]),
+                "bin_1": np.array([0.70, -0.26]),
+            }
+            for bin_name in self.bin_order:
+                self.model.body_pos[self.bin_body_ids[bin_name], :2] = (
+                    centers[bin_name] - nominal_centers[bin_name]
+                )
 
     def render_rgb(self) -> np.ndarray:
         if self.renderer is None:
@@ -506,12 +573,13 @@ class FactoryFloorEnv:
         self._randomize_visual_task()
         self._randomize_part_layout()
         mujoco.mj_forward(self.model, self.data)
-        self._update_gripper_pose()
         self.holding_part = None
-        self.current_gripper_vector = self.gripper_pick_vector.copy()
         self.released_part = None
         self.released_target_bin = None
         self.drop_settle_elapsed = 0.0
+        self.grasp_elapsed = 0.0
+        self.grasp_lost_elapsed = 0.0
+        self.gripper_phase_elapsed = 0.0
         self.active_part = None
         self.completed_parts = set()
         self.visual_targets = None
@@ -525,10 +593,10 @@ class FactoryFloorEnv:
     def set_visual_targets(self, commands: list[dict[str, np.ndarray]]) -> dict:
         """Latch RGB-derived task targets for the classical motion controller.
 
-        The nearest-body association below is a simulator-only grasp adapter: the
-        current workcell has no physical gripper, so MuJoCo needs an internal body
-        name to implement attachment. It does not change a predicted pick point or
-        bin match and is never exposed to the visual policy.
+        The nearest-body association below maps anonymous RGB detections to
+        simulator bodies only so contact can be verified against the intended
+        object. It does not alter the predicted pick point or bin match and is
+        never exposed to the visual policy.
         """
         if not commands:
             raise ValueError("visual policy supplied no pick commands")
@@ -615,7 +683,12 @@ class FactoryFloorEnv:
         del t
         self._advance_controller_state()
         target_pos = self._controller_target_position()
-        if self.controller_phase in {"idle", "return_home", "drop_failed"}:
+        if self.controller_phase in {
+            "idle",
+            "return_home",
+            "drop_failed",
+            "grasp_failed",
+        }:
             # Cartesian position alone has several UR5e solutions. Returning to
             # the known joint posture prevents the next pick from starting on
             # a table-facing IK branch.
@@ -634,7 +707,7 @@ class FactoryFloorEnv:
         )
 
     def _reset_joint_trajectory(self) -> None:
-        current = self.data.ctrl.copy()
+        current = self.data.ctrl[: self.arm_dofs].copy()
         self.trajectory_phase = None
         self.trajectory_start = current.copy()
         self.trajectory_goal = current.copy()
@@ -644,9 +717,13 @@ class FactoryFloorEnv:
     def _trajectory_command(self, target_q: np.ndarray) -> np.ndarray:
         """Return a speed-limited C2-continuous joint command for this phase."""
         target_q = np.clip(target_q, self.ctrl_low, self.ctrl_high)
-        if self.trajectory_phase != self.controller_phase:
+        target_drifted = bool(
+            self._trajectory_complete()
+            and np.max(np.abs(target_q - self.trajectory_goal)) > 0.015
+        )
+        if self.trajectory_phase != self.controller_phase or target_drifted:
             self.trajectory_phase = self.controller_phase
-            self.trajectory_start = self.data.ctrl.copy()
+            self.trajectory_start = self.data.ctrl[: self.arm_dofs].copy()
             self.trajectory_goal = target_q.copy()
             self.trajectory_elapsed = 0.0
             delta = np.abs(self.trajectory_goal - self.trajectory_start)
@@ -657,7 +734,11 @@ class FactoryFloorEnv:
             acceleration_time = np.sqrt(
                 5.7735 * delta / self.max_joint_acceleration
             )
-            jerk_time = np.cbrt(60.0 * delta / self.max_joint_jerk)
+            jerk_time = np.cbrt(
+                60.0
+                * delta
+                / (self.trajectory_jerk_margin * self.max_joint_jerk)
+            )
             if float(np.max(delta)) < 1e-6:
                 self.trajectory_duration = self.control_dt
             else:
@@ -667,6 +748,13 @@ class FactoryFloorEnv:
                     float(np.max(acceleration_time)),
                     float(np.max(jerk_time)),
                 )
+                if self.controller_phase == "move_to_bin_hover":
+                    self.trajectory_duration *= 3.0
+                elif self.controller_phase == "move_to_transfer":
+                    # This phase also rotates from the pick attitude to the bin
+                    # attitude. Slow it under load so rounded parts do not gain
+                    # enough lateral momentum to slide out of the real pads.
+                    self.trajectory_duration *= 2.5
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration
@@ -682,21 +770,26 @@ class FactoryFloorEnv:
 
     def set_arm_configuration(self, qpos: np.ndarray) -> None:
         target = np.clip(qpos, self.ctrl_low, self.ctrl_high)
-        self.data.ctrl[:] = target
+        self.data.ctrl[: self.arm_dofs] = target
+        self.data.ctrl[self.gripper_actuator_id] = self._gripper_control_target()
+        adhesion_control = float(self._gripper_control_target() > 0.0)
+        self.data.ctrl[self.gripper_adhesion_actuator_ids] = adhesion_control
         self.contact_pairs_this_step.clear()
         for _ in range(self.control_substeps):
-            self._update_gripper_pose()
-            if self.holding_part is not None:
-                self._update_attachment()
             mujoco.mj_step(self.model, self.data)
             self.contact_pairs_this_step.update(
                 (min(int(contact.geom1), int(contact.geom2)),
                  max(int(contact.geom1), int(contact.geom2)))
                 for contact in self.data.contact[: self.data.ncon]
             )
-            if self.holding_part is not None:
-                self._update_attachment()
-            self._update_gripper_pose()
+        if self.controller_phase == "close_gripper":
+            self.grasp_elapsed += self.control_dt
+        else:
+            self.grasp_elapsed = 0.0
+        if self.controller_phase == "open_gripper":
+            self.gripper_phase_elapsed += self.control_dt
+        else:
+            self.gripper_phase_elapsed = 0.0
         if self.released_part is not None:
             self.drop_settle_elapsed += self.control_dt
         self._update_task_progress()
@@ -753,13 +846,30 @@ class FactoryFloorEnv:
             if self.active_part is None or self.active_part in self.completed_parts:
                 self.controller_phase = "select_part"
                 return
-            if self.holding_part == self.active_part:
+            if self._trajectory_complete() and self._ee_close_to_pick(
+                self.active_part, self._motion_position_tolerance()
+            ):
+                self.grasp_elapsed = 0.0
+                self.controller_phase = "close_gripper"
+            return
+
+        if self.controller_phase == "close_gripper":
+            if (
+                self.holding_part == self.active_part
+                and self.grasp_elapsed >= self.grasp_settle_duration
+                and self._trajectory_complete()
+            ):
                 self.controller_phase = "lift_with_part"
+            elif (
+                self.holding_part is None
+                and self.grasp_elapsed >= self.grasp_close_duration
+            ):
+                self.controller_phase = "grasp_failed"
             return
 
         if self.controller_phase == "lift_with_part":
             if self.holding_part is None:
-                self.controller_phase = "select_part"
+                self.controller_phase = "grasp_failed"
                 return
             if self._trajectory_complete() and self._ee_close_to_position(
                 self.last_pick_hover_target, self._motion_position_tolerance()
@@ -769,7 +879,7 @@ class FactoryFloorEnv:
 
         if self.controller_phase == "move_to_transfer":
             if self.holding_part is None:
-                self.controller_phase = "select_part"
+                self.controller_phase = "grasp_failed"
                 return
             if self._trajectory_complete() and self._ee_close_to_position(
                 self.transfer_target, self._motion_position_tolerance()
@@ -779,7 +889,7 @@ class FactoryFloorEnv:
 
         if self.controller_phase == "move_to_bin_hover":
             if self.holding_part is None:
-                self.controller_phase = "select_part"
+                self.controller_phase = "grasp_failed"
                 return
             hover_target = self._part_bin_hover_target(self.holding_part)
             if self._trajectory_complete() and self._ee_close_to_position(
@@ -790,6 +900,23 @@ class FactoryFloorEnv:
 
         if self.controller_phase == "move_to_drop":
             if self.holding_part is None:
+                self.controller_phase = "grasp_failed"
+                return
+            if self._trajectory_complete() and self._ee_close_to_position(
+                self._part_drop_release_target(self.holding_part),
+                self._motion_position_tolerance(),
+            ):
+                target_bin = self._part_sim_target_bin(self.holding_part)
+                self._release_part(self.holding_part, target_bin)
+                self.gripper_phase_elapsed = 0.0
+                self.controller_phase = "open_gripper"
+            return
+
+        if self.controller_phase == "open_gripper":
+            if (
+                self.gripper_phase_elapsed >= self.gripper_release_duration
+                and self._trajectory_complete()
+            ):
                 self.controller_phase = "settle_drop"
             return
 
@@ -798,7 +925,14 @@ class FactoryFloorEnv:
                 self.controller_phase = "return_home"
                 return
             if self.drop_settle_elapsed >= self.drop_settle_duration:
-                if self._released_part_inside_target_bin():
+                withdrawal_complete = (
+                    self._trajectory_complete()
+                    and self._ee_close_to_position(
+                        self._part_bin_hover_target(self.released_part),
+                        self._motion_position_tolerance(),
+                    )
+                )
+                if self._released_part_inside_target_bin() and withdrawal_complete:
                     self.completed_parts.add(self.released_part)
                     self.released_part = None
                     self.released_target_bin = None
@@ -820,14 +954,28 @@ class FactoryFloorEnv:
                     "select_part" if self._choose_next_part() is not None else "idle"
                 )
 
+        if self.controller_phase == "grasp_failed":
+            self.holding_part = None
+            self.active_part = None
+            self.last_pick_hover_target = self.home_ee_target.copy()
+            self.controller_phase = "return_home"
+
     def _controller_target_position(self) -> np.ndarray:
-        if self.controller_phase in {"idle", "return_home", "drop_failed"}:
+        if self.controller_phase in {
+            "idle",
+            "return_home",
+            "drop_failed",
+            "grasp_failed",
+        }:
             return self.home_ee_target
 
         if self.controller_phase == "move_to_pick_hover" and self.active_part is not None:
             return self._pick_hover_target(self.active_part)
 
         if self.controller_phase == "move_to_pick" and self.active_part is not None:
+            return self._pick_target(self.active_part)
+
+        if self.controller_phase == "close_gripper" and self.active_part is not None:
             return self._pick_target(self.active_part)
 
         if self.controller_phase == "lift_with_part":
@@ -844,12 +992,20 @@ class FactoryFloorEnv:
             return self._part_bin_hover_target(part_name)
         if self.controller_phase == "move_to_drop":
             return self._part_drop_release_target(part_name)
+        if self.controller_phase == "open_gripper" and self.released_part is not None:
+            return self._part_drop_release_target(self.released_part)
         if self.controller_phase == "settle_drop":
             return self._part_bin_hover_target(part_name)
         return self.home_ee_target
 
     def _solve_inverse_kinematics(self, target_pos: np.ndarray) -> np.ndarray:
-        q = self.data.qpos[: self.arm_dofs].copy()
+        q = (
+            self.bin_ik_seed.copy()
+            if self.controller_phase == "move_to_transfer"
+            else self.bin_approach_ik_seed.copy()
+            if self.controller_phase in {"move_to_bin_hover", "move_to_drop"}
+            else self.data.qpos[: self.arm_dofs].copy()
+        )
         jacp = np.zeros((3, self.model.nv), dtype=float)
         jacr = np.zeros((3, self.model.nv), dtype=float)
 
@@ -860,24 +1016,56 @@ class FactoryFloorEnv:
             mujoco.mj_forward(self.model, self.ik_data)
 
             ee_pos = self.ik_data.site_xpos[self.ee_site_id].copy()
-            error = target_pos - ee_pos
+            current_quat = np.empty(4, dtype=float)
+            mujoco.mju_mat2Quat(
+                current_quat, self.ik_data.site_xmat[self.ee_site_id]
+            )
+            target_quat = np.empty(4, dtype=float)
+            mujoco.mju_mat2Quat(
+                target_quat, self._gripper_target_rotation().ravel()
+            )
+            inverse_current = np.empty(4, dtype=float)
+            mujoco.mju_negQuat(inverse_current, current_quat)
+            delta_quat = np.empty(4, dtype=float)
+            mujoco.mju_mulQuat(delta_quat, target_quat, inverse_current)
+            rotation_error = np.empty(3, dtype=float)
+            mujoco.mju_quat2Vel(rotation_error, delta_quat, 1.0)
+            error = np.concatenate((target_pos - ee_pos, rotation_error))
             if float(np.linalg.norm(error)) < self.ik_tolerance:
                 break
 
             mujoco.mj_jacSite(self.model, self.ik_data, jacp, jacr, self.ee_site_id)
-            arm_jac = jacp[:, : self.arm_dofs]
+            arm_jac = np.vstack((jacp, jacr))[:, : self.arm_dofs]
             regularized = arm_jac @ arm_jac.T + (
                 self.ik_damping**2
             ) * np.eye(error.shape[0])
             dq = arm_jac.T @ np.linalg.solve(regularized, error)
-            dq += self.ik_rest_gain * (self.home_ctrl - q)
-
             step_norm = float(np.linalg.norm(dq))
             if step_norm > self.ik_max_update:
                 dq *= self.ik_max_update / step_norm
             q = np.clip(q + self.ik_step_scale * dq, self.ctrl_low, self.ctrl_high)
 
         return q
+
+    def _gripper_target_direction(self) -> np.ndarray:
+        if self.controller_phase in {
+            "move_to_transfer",
+            "move_to_bin_hover",
+            "move_to_drop",
+            "open_gripper",
+            "settle_drop",
+        }:
+            return self.gripper_bin_direction
+        return self.gripper_pick_direction
+
+    def _gripper_target_rotation(self) -> np.ndarray:
+        z_axis = self._gripper_target_direction()
+        # Keep the jaw-closing axis horizontal so gravity cannot slide thin
+        # pieces toward one fingertip during transport.
+        y_axis = np.cross(np.array([0.0, 0.0, 1.0]), z_axis)
+        y_axis /= np.linalg.norm(y_axis)
+        x_axis = np.cross(y_axis, z_axis)
+        return np.column_stack((x_axis, y_axis, z_axis))
 
     def _randomize_part_layout(self) -> None:
         occupied_xy: list[np.ndarray] = []
@@ -945,37 +1133,39 @@ class FactoryFloorEnv:
         if self.visual_targets is not None:
             target = np.asarray(
                 self.visual_targets[part_name]["pick_position"], dtype=float
-            ) + self.pick_offset
+            ).copy()
         else:
-            target = (
-                self.data.xpos[self.part_body_ids[part_name]].copy()
-                + self.pick_offset
-            )
-        target[2] = max(target[2], 0.635)
+            target = self.data.xpos[self.part_body_ids[part_name]].copy()
+        # The official pinch site is centered between the pads. Use the live
+        # object height after it has settled; a world-Z offset would become a
+        # lateral pad error because this collision-safe approach is angled.
+        support_height = float(self.part_specs[part_name]["support_height"])
+        center_offset = self.grasp_table_clearance + min(
+            self.max_grasp_center_offset,
+            max(0.0, self.low_profile_grasp_height - support_height),
+        )
+        target[2] = (
+            self.data.xpos[self.part_body_ids[part_name], 2] + center_offset
+        )
         return target
 
     def _pick_hover_target(self, part_name: str) -> np.ndarray:
         if self.visual_targets is not None:
             target = np.asarray(
                 self.visual_targets[part_name]["pick_position"], dtype=float
-            ) + self.pick_hover_offset
+            ).copy()
         else:
-            target = (
-                self.data.xpos[self.part_body_ids[part_name]].copy()
-                + self.pick_hover_offset
-            )
-        target[2] = max(target[2], 0.785)
+            target = self.data.xpos[self.part_body_ids[part_name]].copy()
+        target[2] = self.table_surface_z + self.pick_hover_height
         return target
 
     def _bin_hover_target(self, bin_name: str) -> np.ndarray:
         bin_position = self.data.site_xpos[self.bin_site_ids[bin_name]].copy()
-        bin_position[:2] -= self.gripper_bin_vector[:2]
         bin_position[2] = self.drop_hover_height
         return bin_position
 
     def _drop_release_target(self, bin_name: str) -> np.ndarray:
         bin_position = self.data.site_xpos[self.bin_site_ids[bin_name]].copy()
-        bin_position[:2] -= self.gripper_bin_vector[:2]
         bin_position[2] = self.drop_release_height
         return bin_position
 
@@ -985,7 +1175,6 @@ class FactoryFloorEnv:
         bin_position = np.asarray(
             self.visual_targets[part_name]["bin_position"], dtype=float
         ).copy()
-        bin_position[:2] -= self.gripper_bin_vector[:2]
         bin_position[2] = self.drop_hover_height
         return bin_position
 
@@ -995,7 +1184,6 @@ class FactoryFloorEnv:
         bin_position = np.asarray(
             self.visual_targets[part_name]["bin_position"], dtype=float
         ).copy()
-        bin_position[:2] -= self.gripper_bin_vector[:2]
         bin_position[2] = self.drop_release_height
         return bin_position
 
@@ -1019,96 +1207,64 @@ class FactoryFloorEnv:
         self.data.qvel[vel_adr : vel_adr + 6] = 0.0
 
     def _update_task_progress(self) -> None:
-        if self.holding_part is None:
-            if (
-                self.controller_phase == "move_to_pick"
-                and self.active_part is not None
-                and self.active_part not in self.completed_parts
-                and self._trajectory_complete()
-                and self._ee_close_to_pick(self.active_part)
-            ):
+        if self.controller_phase == "close_gripper" and self.active_part is not None:
+            if self._has_bilateral_pad_contact(self.active_part):
                 self.holding_part = self.active_part
-                self._set_part_collision_enabled(self.holding_part, enabled=False)
-                self._update_attachment()
+                self.grasp_lost_elapsed = 0.0
             return
 
-        target_bin = self._part_sim_target_bin(self.holding_part)
-        if (
-            self.controller_phase == "move_to_drop"
-            and self._trajectory_complete()
-            and self._ee_close_to_position(
-                self._part_drop_release_target(self.holding_part),
-                self._motion_position_tolerance(),
-            )
-        ):
-            self._release_part(self.holding_part, target_bin)
-
-    def _update_attachment(self) -> None:
         if self.holding_part is None:
             return
-        ee_pos = self.data.site_xpos[self.ee_site_id].copy()
-        tip_pos = ee_pos + self.current_gripper_vector
-        target_qpos = np.array(
-            [
-                tip_pos[0],
-                tip_pos[1],
-                tip_pos[2],
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-            ],
-            dtype=float,
-        )
-        self._write_freejoint_qpos(self.holding_part, target_qpos)
-        mujoco.mj_forward(self.model, self.data)
-
-    def _update_gripper_pose(self) -> None:
-        pick_vector = self.gripper_pick_vector
-        if self.holding_part is not None and self.controller_phase in {
+        if self.controller_phase in {
+            "lift_with_part",
             "move_to_transfer",
             "move_to_bin_hover",
             "move_to_drop",
         }:
-            if self.controller_phase == "move_to_transfer":
-                progress = min(
-                    self.trajectory_elapsed / max(self.trajectory_duration, 1e-9),
-                    1.0,
-                )
-                blend = 10.0 * progress**3 - 15.0 * progress**4 + 6.0 * progress**5
-                direction = (
-                    (1.0 - blend) * pick_vector
-                    + blend * self.gripper_bin_vector
-                )
-                self.current_gripper_vector = (
-                    self.gripper_length * direction / np.linalg.norm(direction)
-                )
+            if self._grasp_is_retained(self.holding_part):
+                self.grasp_lost_elapsed = 0.0
             else:
-                self.current_gripper_vector = self.gripper_bin_vector.copy()
-        elif self.controller_phase == "settle_drop" and self.released_part is not None:
-            self.current_gripper_vector = self.gripper_bin_vector.copy()
-        else:
-            self.current_gripper_vector = pick_vector.copy()
+                self.grasp_lost_elapsed += self.control_dt
+                if self.grasp_lost_elapsed >= self.grasp_loss_timeout:
+                    self.holding_part = None
 
-        self.data.mocap_pos[self.gripper_mocap_id] = self.data.site_xpos[
-            self.ee_site_id
-        ]
-        direction = self.current_gripper_vector / np.linalg.norm(
-            self.current_gripper_vector
+    def _grasp_is_retained(self, part_name: str) -> bool:
+        # Bilateral contact is required to declare the initial grasp. During
+        # motion MuJoCo may reduce a redundant contact manifold to one pad even
+        # while the closed linkage mechanically cages the object. Separation
+        # from the pinch frame is the reliable loss criterion; it never applies
+        # forces or rewrites the object's state.
+        separation = np.linalg.norm(
+            self.data.xpos[self.part_body_ids[part_name]]
+            - self.data.site_xpos[self.ee_site_id]
         )
-        local_z_world = -direction
-        reference = (
-            np.array([0.0, 1.0, 0.0], dtype=float)
-            if abs(local_z_world[2]) > 0.9
-            else np.array([0.0, 0.0, 1.0], dtype=float)
+        return bool(separation < 0.075)
+
+    def _has_bilateral_pad_contact(self, part_name: str) -> bool:
+        part_geom_id = self.part_geom_ids[part_name]
+        touching_sides: set[str] = set()
+        for geom1, geom2 in self.contact_pairs_this_step:
+            if part_geom_id not in {geom1, geom2}:
+                continue
+            other = geom2 if geom1 == part_geom_id else geom1
+            for side, pad_ids in self.gripper_pad_geom_ids.items():
+                if other in pad_ids:
+                    touching_sides.add(side)
+        return touching_sides == set(self.gripper_pad_geom_ids)
+
+    def _gripper_control_target(self) -> float:
+        closed_phases = {
+            "close_gripper",
+            "lift_with_part",
+            "move_to_transfer",
+            "move_to_bin_hover",
+            "move_to_drop",
+        }
+        return (
+            self.gripper_close_ctrl
+            if self.controller_phase in closed_phases
+            else self.gripper_open_ctrl
         )
-        x_axis = np.cross(reference, local_z_world)
-        x_axis /= np.linalg.norm(x_axis)
-        y_axis = np.cross(local_z_world, x_axis)
-        rotation = np.column_stack((x_axis, y_axis, local_z_world))
-        quaternion = np.empty(4, dtype=float)
-        mujoco.mju_mat2Quat(quaternion, rotation.ravel())
-        self.data.mocap_quat[self.gripper_mocap_id] = quaternion
 
     def _ee_close_to_pick(self, part_name: str, tol: float = 0.05) -> bool:
         target = self._pick_target(part_name)
@@ -1125,8 +1281,7 @@ class FactoryFloorEnv:
         return float(np.linalg.norm(self.data.site_xpos[self.ee_site_id] - target)) < tol
 
     def _release_part(self, part_name: str, bin_name: str) -> None:
-        """Open the simplified gripper without changing the part pose."""
-        self._set_part_collision_enabled(part_name, enabled=True)
+        """Open the physical fingers without rewriting the part pose."""
         self.holding_part = None
         self.released_part = part_name
         self.released_target_bin = bin_name
@@ -1164,7 +1319,9 @@ class FactoryFloorEnv:
     def _set_robot_configuration(self, q: np.ndarray) -> None:
         self.data.qpos[: self.arm_dofs] = q
         self.data.qvel[: self.arm_dofs] = 0.0
-        self.data.ctrl[:] = q
+        self.data.ctrl[: self.arm_dofs] = q
+        self.data.ctrl[self.gripper_actuator_id] = self.gripper_open_ctrl
+        self.data.ctrl[self.gripper_adhesion_actuator_ids] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
     def _task_reward(self) -> float:
