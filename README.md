@@ -32,6 +32,11 @@ frame supplied to the future visual policy. The panel runs in a separate process
 so its OpenCV/Cocoa event loop cannot conflict with MuJoCo's GLFW window. Press
 `q` or Escape in that panel to exit. Use `--no-camera-panel` to hide it.
 
+The regular oracle demo labels that panel `ORACLE OVERLAY` and draws display-only
+part/bin contours and matching arrows. `visual_sort_demo.py` labels it
+`VISUAL POLICY OVERLAY` and draws the learned detections instead. In both cases
+the underlying policy RGB remains unannotated.
+
 After the final object settles in its bin, the arm returns fully home, prints a
 success line with object count, simulated time, wall time, and throughput, then
 closes both windows and the camera child process automatically.

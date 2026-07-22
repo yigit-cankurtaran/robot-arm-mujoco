@@ -117,7 +117,11 @@ def main() -> None:
                         camera_panel.close()
                         camera_panel = None
                     else:
-                        camera_panel.publish(overlay, env.controller_phase)
+                        camera_panel.publish(
+                            overlay,
+                            env.controller_phase,
+                            "VISUAL POLICY OVERLAY",
+                        )
                 if failure is not None:
                     log_path = write_safety_failure(failure)
                     print(safety_failure_message(failure, log_path))

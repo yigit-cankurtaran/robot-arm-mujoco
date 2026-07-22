@@ -12,7 +12,10 @@ CAMERA_WINDOW = "Visual policy observation"
 
 
 def build_camera_panel(
-    rgb: np.ndarray, phase: str, scale: int = 2
+    rgb: np.ndarray,
+    phase: str,
+    scale: int = 2,
+    title: str = "POLICY RGB",
 ) -> np.ndarray:
     import cv2
 
@@ -25,7 +28,7 @@ def build_camera_panel(
     header = np.full((34, resized.shape[1], 3), 24, dtype=np.uint8)
     cv2.putText(
         header,
-        f"POLICY RGB  |  {phase}",
+        f"{title}  |  {phase}",
         (10, 23),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -71,8 +74,11 @@ def _camera_worker(
                 pass
 
             if latest is not None:
-                rgb, phase = latest
-                cv2.imshow(CAMERA_WINDOW, build_camera_panel(rgb, phase, scale))
+                rgb, phase, title = latest
+                cv2.imshow(
+                    CAMERA_WINDOW,
+                    build_camera_panel(rgb, phase, scale, title),
+                )
             key = cv2.waitKey(1) & 0xFF
             if key in {ord("q"), 27}:
                 close_event.set()
@@ -121,10 +127,15 @@ class CameraPanelProcess:
             return "camera process did not initialize within five seconds"
         return self.poll_error()
 
-    def publish(self, rgb: np.ndarray, phase: str) -> None:
+    def publish(
+        self,
+        rgb: np.ndarray,
+        phase: str,
+        title: str = "POLICY RGB",
+    ) -> None:
         if not self.started or self.close_event.is_set():
             return
-        frame = (rgb.copy(), phase)
+        frame = (rgb.copy(), phase, title)
         try:
             self.frame_queue.put_nowait(frame)
         except queue.Full:

@@ -8,6 +8,7 @@ import mujoco.viewer
 from camera_panel import CameraPanelProcess
 from demo_runtime import sort_is_complete, sort_success_message
 from env import FactoryFloorEnv
+from oracle_overlay import draw_oracle_task_overlay
 from safety_monitor import (
     detect_safety_failure,
     safety_failure_message,
@@ -37,6 +38,7 @@ def main() -> None:
                 camera_panel = None
 
         print(env.describe_task())
+        overlay = draw_oracle_task_overlay(env, env.last_rgb)
         run_started = time.perf_counter()
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.cam.azimuth = 138
@@ -48,6 +50,13 @@ def main() -> None:
                 result = env.scripted_step()
                 wall_seconds = time.perf_counter() - run_started
                 failure = detect_safety_failure(env, wall_seconds)
+                rendered_this_tick = (
+                    (env.rgb_frame_counter - 1) % env.rgb_render_interval == 0
+                )
+                if rendered_this_tick:
+                    overlay = draw_oracle_task_overlay(
+                        env, result.observation["rgb"]
+                    )
                 viewer.sync()
                 if camera_panel is not None:
                     if camera_panel.user_requested_close():
@@ -59,7 +68,9 @@ def main() -> None:
                         camera_panel = None
                     else:
                         camera_panel.publish(
-                            result.observation["rgb"], env.controller_phase
+                            overlay,
+                            env.controller_phase,
+                            "ORACLE OVERLAY",
                         )
                 if failure is not None:
                     log_path = write_safety_failure(failure)
