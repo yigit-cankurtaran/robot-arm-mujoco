@@ -47,6 +47,9 @@ class FactoryFloorEnv:
         camera_width: int = 240,
         camera_height: int = 240,
         rgb_render_interval: int = 1,
+        min_active_parts: int = 1,
+        max_active_parts: int = 3,
+        randomize_bin_positions: bool = True,
     ):
         self.xml_path = Path(xml_path)
         self.camera_name = camera_name
@@ -61,11 +64,25 @@ class FactoryFloorEnv:
         if rgb_render_interval < 1:
             raise ValueError("rgb_render_interval must be at least 1")
         self.rgb_render_interval = rgb_render_interval
+        if not 1 <= min_active_parts <= max_active_parts <= 3:
+            raise ValueError("active part count must satisfy 1 <= min <= max <= 3")
+        self.min_active_parts = min_active_parts
+        self.max_active_parts = max_active_parts
+        self.randomize_bin_positions = randomize_bin_positions
         self.rgb_frame_counter = 0
         self.last_rgb: np.ndarray | None = None
         self.policy_scene_option = mujoco.MjvOption()
         mujoco.mjv_defaultOption(self.policy_scene_option)
         self.policy_scene_option.sitegroup[:] = 0
+        # The physical camera support remains visible in the interactive viewer
+        # and remains a collision object, but an underslung inspection camera
+        # should not see its own mounting bar across the image.
+        camera_pole_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "camera_pole"
+        )
+        if camera_pole_geom_id >= 0:
+            self.model.geom_group[camera_pole_geom_id] = 3
+            self.policy_scene_option.geomgroup[3] = 0
         self.renderer: mujoco.Renderer | None = None
         self.camera_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.camera_name
@@ -148,6 +165,7 @@ class FactoryFloorEnv:
             },
         }
         self.part_order = list(self.part_specs)
+        self.active_part_order = self.part_order.copy()
         self.bin_order = ["bin_0", "bin_1"]
 
         self.ee_site_id = mujoco.mj_name2id(
@@ -168,6 +186,18 @@ class FactoryFloorEnv:
             "bin_1": mujoco.mj_name2id(
                 self.model, mujoco.mjtObj.mjOBJ_SITE, "bin_orange_hover"
             ),
+        }
+        self.bin_body_ids = {
+            "bin_0": mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, "blue_bin"
+            ),
+            "bin_1": mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, "orange_bin"
+            ),
+        }
+        self.base_bin_body_pos = {
+            name: self.model.body_pos[body_id].copy()
+            for name, body_id in self.bin_body_ids.items()
         }
         # The lower orange approach avoids the UR5e's upper-arm/table grazing
         # posture while retaining clearance over the bin walls.
@@ -232,6 +262,7 @@ class FactoryFloorEnv:
         self.trajectory_elapsed = 0.0
         self.trajectory_duration = self.min_trajectory_duration
         self.contact_pairs_this_step: set[tuple[int, int]] = set()
+        self.visual_targets: dict[str, dict[str, np.ndarray | str]] | None = None
 
         if self.enable_rgb_observation:
             self.renderer = mujoco.Renderer(
@@ -292,21 +323,60 @@ class FactoryFloorEnv:
         for bin_name in self.bin_order:
             self._set_geom_color(self.bin_geom_ids[bin_name], self.bin_colors[bin_name])
 
-        # Both bins receive at least one part. The remaining part and ordering
-        # are sampled, so geometry names never imply a destination.
-        assignments = self.bin_order.copy()
-        assignments.append(
-            self.bin_order[int(self.random_state.integers(len(self.bin_order)))]
-        )
+        # With two or more visible parts, both relational colors are represented.
+        # A one-part scene samples either bin and remains a valid matching task.
+        if len(self.active_part_order) >= 2:
+            assignments = self.bin_order.copy()
+            assignments.extend(
+                self.bin_order[int(self.random_state.integers(len(self.bin_order)))]
+                for _ in range(len(self.active_part_order) - 2)
+            )
+        else:
+            assignments = [
+                self.bin_order[int(self.random_state.integers(len(self.bin_order)))]
+            ]
         self.random_state.shuffle(assignments)
         self.part_colors = {}
-        for part_name, target_bin in zip(self.part_order, assignments, strict=True):
+        for part_name, target_bin in zip(
+            self.active_part_order, assignments, strict=True
+        ):
             match_id = self.bin_order.index(target_bin)
             self.part_specs[part_name]["match_id"] = match_id
             self.part_specs[part_name]["target_bin"] = target_bin
             color = self.bin_colors[target_bin].copy()
             self.part_colors[part_name] = color
             self._set_geom_color([self.part_geom_ids[part_name]], color)
+
+        for part_name in set(self.part_order) - set(self.active_part_order):
+            self.part_specs[part_name].pop("match_id", None)
+            self.part_specs[part_name].pop("target_bin", None)
+            self.model.geom_rgba[self.part_geom_ids[part_name], 3] = 0.0
+
+    def _randomize_task_structure(self) -> None:
+        active_count = int(
+            self.random_state.integers(
+                self.min_active_parts, self.max_active_parts + 1
+            )
+        )
+        chosen = self.random_state.choice(
+            self.part_order, size=active_count, replace=False
+        )
+        chosen_names = {str(name) for name in chosen}
+        self.active_part_order = [
+            name for name in self.part_order if name in chosen_names
+        ]
+
+        for name, body_id in self.bin_body_ids.items():
+            self.model.body_pos[body_id] = self.base_bin_body_pos[name]
+        if self.randomize_bin_positions:
+            # Keep each bin on its safe side of the feed tray while varying its
+            # position enough that image coordinates cannot be memorized.
+            self.model.body_pos[self.bin_body_ids["bin_0"], :2] += (
+                self.random_state.uniform([-0.04, 0.0], [0.04, 0.05])
+            )
+            self.model.body_pos[self.bin_body_ids["bin_1"], :2] += (
+                self.random_state.uniform([-0.04, -0.05], [0.04, 0.0])
+            )
 
     def render_rgb(self) -> np.ndarray:
         if self.renderer is None:
@@ -338,11 +408,11 @@ class FactoryFloorEnv:
         return {
             "part_to_bin": {
                 name: self.part_specs[name]["target_bin"]
-                for name in self.part_order
+                for name in self.active_part_order
             },
             "match_ids": {
                 name: int(self.part_specs[name]["match_id"])
-                for name in self.part_order
+                for name in self.active_part_order
             },
             "bin_colors_rgba": {
                 name: self.bin_colors[name].copy()
@@ -350,8 +420,9 @@ class FactoryFloorEnv:
             },
             "part_colors_rgba": {
                 name: self.part_colors[name].copy()
-                for name in self.part_order
+                for name in self.active_part_order
             },
+            "active_parts": self.active_part_order.copy(),
         }
 
     def close(self) -> None:
@@ -364,18 +435,101 @@ class FactoryFloorEnv:
         self._set_robot_configuration(self.home_ctrl)
         for name in self.part_order:
             self._set_part_collision_enabled(name, enabled=True)
+            self.model.geom_rgba[self.part_geom_ids[name], 3] = 1.0
+        self._randomize_task_structure()
+        for name in set(self.part_order) - set(self.active_part_order):
+            self._set_part_collision_enabled(name, enabled=False)
         self._randomize_visual_task()
         self._randomize_part_layout()
         mujoco.mj_forward(self.model, self.data)
         self.holding_part = None
         self.active_part = None
         self.completed_parts = set()
+        self.visual_targets = None
         self.controller_phase = "select_part"
         self.last_pick_hover_target = self.home_ee_target.copy()
         self._reset_joint_trajectory()
         self.rgb_frame_counter = 0
         self.last_rgb = None
         return self._get_observation(), self._get_info()
+
+    def set_visual_targets(self, commands: list[dict[str, np.ndarray]]) -> dict:
+        """Latch RGB-derived task targets for the classical motion controller.
+
+        The nearest-body association below is a simulator-only grasp adapter: the
+        current workcell has no physical gripper, so MuJoCo needs an internal body
+        name to implement attachment. It does not change a predicted pick point or
+        bin match and is never exposed to the visual policy.
+        """
+        if not commands:
+            raise ValueError("visual policy supplied no pick commands")
+        unmatched_parts = set(self.active_part_order) - self.completed_parts
+        targets: dict[str, dict[str, np.ndarray | str]] = {}
+        associations = []
+        for command in commands:
+            pick = np.asarray(command["pick_position"], dtype=float).copy()
+            target = np.asarray(command["bin_position"], dtype=float).copy()
+            if pick.shape != (3,) or target.shape != (3,):
+                raise ValueError("visual positions must be XYZ vectors")
+            if not (0.25 <= pick[0] <= 0.55 and -0.30 <= pick[1] <= 0.30):
+                raise ValueError(f"unsafe predicted pick position {pick.tolist()}")
+            if not (0.52 <= target[0] <= 0.84 and -0.42 <= target[1] <= 0.42):
+                raise ValueError(f"unsafe predicted bin position {target.tolist()}")
+            if not unmatched_parts:
+                raise ValueError("visual policy predicted too many parts")
+            part_name = min(
+                unmatched_parts,
+                key=lambda name: float(
+                    np.linalg.norm(
+                        self.data.xpos[self.part_body_ids[name]][:2] - pick[:2]
+                    )
+                ),
+            )
+            part_error = float(
+                np.linalg.norm(
+                    self.data.xpos[self.part_body_ids[part_name]][:2] - pick[:2]
+                )
+            )
+            if part_error > 0.06:
+                raise ValueError(
+                    f"predicted pick is {part_error:.3f} m from any simulated part"
+                )
+            bin_name = min(
+                self.bin_order,
+                key=lambda name: float(
+                    np.linalg.norm(
+                        self.data.site_xpos[self.bin_site_ids[name]][:2] - target[:2]
+                    )
+                ),
+            )
+            bin_error = float(
+                np.linalg.norm(
+                    self.data.site_xpos[self.bin_site_ids[bin_name]][:2] - target[:2]
+                )
+            )
+            if bin_error > 0.08:
+                raise ValueError(
+                    f"predicted bin is {bin_error:.3f} m from any simulated bin"
+                )
+            unmatched_parts.remove(part_name)
+            targets[part_name] = {
+                "pick_position": pick,
+                "bin_position": target,
+                "sim_bin": bin_name,
+            }
+            associations.append(
+                {
+                    "sim_part": part_name,
+                    "sim_bin": bin_name,
+                    "pick_error_m": part_error,
+                    "bin_error_m": bin_error,
+                }
+            )
+        self.visual_targets = targets
+        self.active_part = None
+        self.controller_phase = "select_part"
+        self._reset_joint_trajectory()
+        return {"commands": len(targets), "associations": associations}
 
     def step(self, action: np.ndarray) -> StepResult:
         self.set_arm_configuration(action)
@@ -476,7 +630,7 @@ class FactoryFloorEnv:
             "active_part": self.active_part,
             "parts": {
                 name: self._part_state(name)
-                for name in self.part_order
+                for name in self.active_part_order
             },
             "bins": {
                 name: self.data.site_xpos[site_id].round(4).tolist()
@@ -511,7 +665,7 @@ class FactoryFloorEnv:
                 return
             self.last_pick_hover_target = self._pick_hover_target(self.active_part)
             if self._trajectory_complete() and self._ee_close_to_position(
-                self.last_pick_hover_target, self.phase_position_tol
+                self.last_pick_hover_target, self._motion_position_tolerance()
             ):
                 self.controller_phase = "move_to_pick"
             return
@@ -529,7 +683,7 @@ class FactoryFloorEnv:
                 self.controller_phase = "select_part"
                 return
             if self._trajectory_complete() and self._ee_close_to_position(
-                self.last_pick_hover_target, self.phase_position_tol
+                self.last_pick_hover_target, self._motion_position_tolerance()
             ):
                 self.controller_phase = "move_to_transfer"
             return
@@ -539,7 +693,7 @@ class FactoryFloorEnv:
                 self.controller_phase = "select_part"
                 return
             if self._trajectory_complete() and self._ee_close_to_position(
-                self.transfer_target, self.phase_position_tol
+                self.transfer_target, self._motion_position_tolerance()
             ):
                 self.controller_phase = "move_to_bin_hover"
             return
@@ -548,11 +702,9 @@ class FactoryFloorEnv:
             if self.holding_part is None:
                 self.controller_phase = "select_part"
                 return
-            hover_target = self._bin_hover_target(
-                self.part_specs[self.holding_part]["target_bin"]
-            )
+            hover_target = self._part_bin_hover_target(self.holding_part)
             if self._trajectory_complete() and self._ee_close_to_position(
-                hover_target, self.phase_position_tol
+                hover_target, self._motion_position_tolerance()
             ):
                 self.controller_phase = "move_to_drop"
             return
@@ -591,11 +743,10 @@ class FactoryFloorEnv:
         if part_name is None:
             return self.home_ee_target
 
-        target_bin = self.part_specs[part_name]["target_bin"]
         if self.controller_phase == "move_to_bin_hover":
-            return self._bin_hover_target(target_bin)
+            return self._part_bin_hover_target(part_name)
         if self.controller_phase == "move_to_drop":
-            return self._drop_release_target(target_bin)
+            return self._part_drop_release_target(part_name)
         return self.home_ee_target
 
     def _solve_inverse_kinematics(self, target_pos: np.ndarray) -> np.ndarray:
@@ -633,7 +784,7 @@ class FactoryFloorEnv:
         occupied_xy: list[np.ndarray] = []
         self.spawn_layout = {}
 
-        for name in self.part_order:
+        for name in self.active_part_order:
             xy = self._sample_spawn_xy(occupied_xy)
             occupied_xy.append(xy)
             yaw = float(self.random_state.uniform(-np.pi, np.pi))
@@ -671,9 +822,14 @@ class FactoryFloorEnv:
         return anchor + jitter
 
     def _choose_next_part(self) -> str | None:
+        available_parts = (
+            list(self.visual_targets)
+            if self.visual_targets is not None
+            else self.active_part_order
+        )
         candidates = [
             name
-            for name in self.part_order
+            for name in available_parts
             if name not in self.completed_parts and name != self.holding_part
         ]
         if not candidates:
@@ -687,9 +843,17 @@ class FactoryFloorEnv:
         )
 
     def _pick_target(self, part_name: str) -> np.ndarray:
+        if self.visual_targets is not None:
+            return np.asarray(
+                self.visual_targets[part_name]["pick_position"], dtype=float
+            ) + self.pick_offset
         return self.data.xpos[self.part_body_ids[part_name]].copy() + self.pick_offset
 
     def _pick_hover_target(self, part_name: str) -> np.ndarray:
+        if self.visual_targets is not None:
+            return np.asarray(
+                self.visual_targets[part_name]["pick_position"], dtype=float
+            ) + self.pick_hover_offset
         return (
             self.data.xpos[self.part_body_ids[part_name]].copy()
             + self.pick_hover_offset
@@ -700,6 +864,39 @@ class FactoryFloorEnv:
 
     def _drop_release_target(self, bin_name: str) -> np.ndarray:
         return self.data.site_xpos[self.bin_approach_site_ids[bin_name]].copy()
+
+    def _part_bin_hover_target(self, part_name: str) -> np.ndarray:
+        if self.visual_targets is None:
+            return self._bin_hover_target(self.part_specs[part_name]["target_bin"])
+        bin_position = np.asarray(
+            self.visual_targets[part_name]["bin_position"], dtype=float
+        )
+        # Convert the observed bin center into the tested inward approach
+        # corridor. The asymmetric height avoids the UR5e/table posture on the
+        # negative-Y side; this is motion geometry, not a color/bin identity.
+        approach_x = float(np.clip(bin_position[0] - 0.18, 0.48, 0.52))
+        inward_y = bin_position[1] - np.sign(bin_position[1]) * 0.10
+        if bin_position[1] >= 0:
+            approach_y = float(np.clip(inward_y, 0.14, 0.20))
+            approach_z = 0.81
+        else:
+            approach_y = float(np.clip(inward_y, -0.20, -0.14))
+            approach_z = 0.70
+        return np.array([approach_x, approach_y, approach_z], dtype=float)
+
+    def _part_drop_release_target(self, part_name: str) -> np.ndarray:
+        if self.visual_targets is None:
+            return self._drop_release_target(self.part_specs[part_name]["target_bin"])
+        return self._part_bin_hover_target(part_name)
+
+    def _part_sim_target_bin(self, part_name: str) -> str:
+        if self.visual_targets is None:
+            return str(self.part_specs[part_name]["target_bin"])
+        return str(self.visual_targets[part_name]["sim_bin"])
+
+    def _motion_position_tolerance(self) -> float:
+        # Pixel calibration adds roughly 1--2 cm of target uncertainty.
+        return 0.075 if self.visual_targets is not None else self.phase_position_tol
 
     def _read_freejoint_qpos(self, name: str) -> np.ndarray:
         adr = self.part_qpos_adr[name]
@@ -725,11 +922,14 @@ class FactoryFloorEnv:
                 self._update_attachment()
             return
 
-        target_bin = self.part_specs[self.holding_part]["target_bin"]
+        target_bin = self._part_sim_target_bin(self.holding_part)
         if (
             self.controller_phase == "move_to_drop"
             and self._trajectory_complete()
-            and self._ee_ready_to_drop(target_bin)
+            and self._ee_close_to_position(
+                self._part_drop_release_target(self.holding_part),
+                self._motion_position_tolerance(),
+            )
         ):
             self._drop_part_in_bin(self.holding_part, target_bin)
 
@@ -803,7 +1003,8 @@ class FactoryFloorEnv:
 
     def _task_reward(self) -> float:
         reward = 0.0
-        for name, spec in self.part_specs.items():
+        for name in self.active_part_order:
+            spec = self.part_specs[name]
             body_pos = self.data.xpos[self.part_body_ids[name]]
             target_pos = self.data.site_xpos[
                 self.bin_site_ids[spec["target_bin"]]
@@ -851,8 +1052,9 @@ class FactoryFloorEnv:
             "sorted_counts": self._sorted_counts(),
             "parts": {
                 name: self._part_state(name)
-                for name in self.part_order
+                for name in self.active_part_order
             },
+            "active_part_count": len(self.active_part_order),
         }
 
     def _sorted_counts(self) -> dict[str, int]:

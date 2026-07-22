@@ -1,6 +1,6 @@
 # MuJoCo UR5e Pick-And-Sort Cell
 
-This project uses the official MuJoCo Menagerie `universal_robots_ur5e` model inside a custom visual pick-and-sort workcell. Every episode generates new, unlabeled colors and randomly assigns parts to same-color bins. The current oracle task planner provides a safe bridge while a learned visual matcher is trained from RGB observations.
+This project uses the official MuJoCo Menagerie `universal_robots_ur5e` model inside a custom visual pick-and-sort workcell. Every episode generates new, unlabeled colors and randomly assigns parts to same-color bins. It includes both an oracle regression mode and a trained RGB-only visual planner feeding the classical motion controller.
 
 Arm model:
 
@@ -87,14 +87,23 @@ labels; they are never included in the policy observation.
 - The policy observation contains a `240x240` RGB image and 15 robot proprioception values. It does not expose object poses, simulator colors, match IDs, or target bins.
 - During pickup, the selected part is attached to the UR5e end-effector site and carried to the correct bin.
 
-The scripted controller currently reads the privileged `target_bin` assignment
-stored inside the environment. `oracle_task_state()` exposes copies of the same
-truth for dataset labels and evaluation. These fields are absent from policy
-observations and can be replaced by a learned detector and shared
-color-embedding matcher without changing the motion controller.
+The original `demo.py` remains an oracle regression mode. The learned RGB mode
+is available after training:
+
+```bash
+.venv/bin/mjpython visual_sort_demo.py --checkpoint runs/visual_policy/best.pt
+```
+
+It detects variable-count parts and two bins from RGB, performs relational
+same-color matching without named color classes, estimates workspace targets,
+and hands those targets to the existing classical controller. See the
+[learned visual policy guide](docs/learned-visual-policy.md) for reproducible
+generation, training, evaluation, results, and limitations.
 
 This gives a presentable robotics baseline now, while leaving extension points for perception, grasp planning, scheduling, or learning later.
 
 ## Limitations
 - Grasping is still simplified as a scripted attachment to the end-effector site rather than a contact-rich gripper model.
-- Visual dataset generation is implemented, but the learned detector/matching network is the next stage; the live sorter still uses the isolated oracle assignment.
+- The learned baseline is validated only over the present simulation
+  randomization range; real-camera transfer and contact-rich grasping remain
+  future work.

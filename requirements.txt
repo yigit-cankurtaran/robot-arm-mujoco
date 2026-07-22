@@ -2,3 +2,5 @@ mujoco==3.6.0
 glfw==2.10.0
 numpy==2.4.3
 opencv-python==4.13.0.92
+torch>=2.2
+matplotlib>=3.8

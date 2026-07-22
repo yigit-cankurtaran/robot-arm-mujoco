@@ -20,6 +20,8 @@ def main() -> None:
     frame_signatures: list[float] = []
     color_signatures: set[tuple[float, ...]] = set()
     assignments: set[tuple[str, ...]] = set()
+    active_counts: set[int] = set()
+    bin_layouts: set[tuple[float, ...]] = set()
     failures: list[str] = []
     try:
         for seed in range(args.seeds):
@@ -43,7 +45,7 @@ def main() -> None:
 
             segmentation = env.render_segmentation()
             geom_pixels = segmentation[..., 1] == int(mujoco.mjtObj.mjOBJ_GEOM)
-            for part_name in env.part_order:
+            for part_name in env.active_part_order:
                 visible_pixels = int(
                     (
                         (segmentation[..., 0] == env.part_geom_ids[part_name])
@@ -63,7 +65,7 @@ def main() -> None:
                 failures.append(f"seed {seed}: sampled colors are ambiguous")
 
             target_bins = oracle["part_to_bin"]
-            if set(target_bins.values()) != set(env.bin_order):
+            if len(env.active_part_order) >= 2 and set(target_bins.values()) != set(env.bin_order):
                 failures.append(f"seed {seed}: a bin has no matching part")
             for part_name, bin_name in target_bins.items():
                 if not np.allclose(
@@ -77,7 +79,21 @@ def main() -> None:
             color_signatures.add(
                 tuple(np.round(np.concatenate(list(bin_colors.values())), 3))
             )
-            assignments.add(tuple(target_bins[name] for name in env.part_order))
+            assignments.add(tuple(target_bins[name] for name in env.active_part_order))
+            active_counts.add(len(env.active_part_order))
+            bin_layouts.add(
+                tuple(
+                    np.round(
+                        np.concatenate(
+                            [
+                                env.data.site_xpos[env.bin_site_ids[name]][:2]
+                                for name in env.bin_order
+                            ]
+                        ),
+                        3,
+                    )
+                )
+            )
     finally:
         env.close()
 
@@ -87,6 +103,8 @@ def main() -> None:
         failures.append("part-to-bin assignments are not varying across resets")
     if np.ptp(frame_signatures) < 0.25:
         failures.append("rendered observations are not changing across resets")
+    if args.seeds >= 4 and len(bin_layouts) < 2:
+        failures.append("bin positions are not varying across resets")
 
     summary = {
         "passed": not failures,
@@ -94,6 +112,8 @@ def main() -> None:
         "rgb_shape": [env.camera_height, env.camera_width, 3],
         "unique_color_pairs": len(color_signatures),
         "unique_assignments": len(assignments),
+        "active_part_counts": sorted(active_counts),
+        "unique_bin_layouts": len(bin_layouts),
         "frame_mean_range": round(float(np.ptp(frame_signatures)), 4),
         "failures": failures,
     }

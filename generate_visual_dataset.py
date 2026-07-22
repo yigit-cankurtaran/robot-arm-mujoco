@@ -63,7 +63,11 @@ def main() -> None:
 
             part_masks = np.stack(
                 [
-                    _geom_mask(segmentation, [env.part_geom_ids[name]])
+                    (
+                        _geom_mask(segmentation, [env.part_geom_ids[name]])
+                        if name in env.active_part_order
+                        else np.zeros(rgb.shape[:2], dtype=bool)
+                    )
                     for name in env.part_order
                 ]
             )
@@ -75,14 +79,24 @@ def main() -> None:
             )
             target_bin_indices = np.array(
                 [
-                    env.bin_order.index(oracle["part_to_bin"][name])
+                    (
+                        env.bin_order.index(oracle["part_to_bin"][name])
+                        if name in env.active_part_order
+                        else -1
+                    )
                     for name in env.part_order
                 ],
                 dtype=np.int64,
             )
-            part_positions = np.stack(
-                [env.data.xpos[env.part_body_ids[name]].copy() for name in env.part_order]
+            part_present = np.array(
+                [name in env.active_part_order for name in env.part_order], dtype=bool
             )
+            part_positions = np.full((len(env.part_order), 3), np.nan, dtype=float)
+            for part_index, name in enumerate(env.part_order):
+                if part_present[part_index]:
+                    part_positions[part_index] = env.data.xpos[
+                        env.part_body_ids[name]
+                    ].copy()
             bin_positions = np.stack(
                 [
                     env.data.site_xpos[env.bin_site_ids[name]].copy()
@@ -101,6 +115,7 @@ def main() -> None:
                 part_masks=part_masks,
                 bin_masks=bin_masks,
                 part_positions=part_positions,
+                part_present=part_present,
                 bin_positions=bin_positions,
                 target_bin_indices=target_bin_indices,
                 bin_colors=bin_colors,
@@ -116,13 +131,14 @@ def main() -> None:
                     "seed": sample_seed,
                     "visible_part_pixels": part_masks.sum(axis=(1, 2)).tolist(),
                     "visible_bin_pixels": bin_masks.sum(axis=(1, 2)).tolist(),
+                    "active_part_count": int(part_present.sum()),
                 }
             )
     finally:
         env.close()
 
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "samples": args.samples,
         "camera": {
             "name": env.camera_name,
@@ -134,6 +150,7 @@ def main() -> None:
             "part_masks",
             "bin_masks",
             "part_positions",
+            "part_present",
             "bin_positions",
             "target_bin_indices",
         ],

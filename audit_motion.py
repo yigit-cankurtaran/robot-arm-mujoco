@@ -91,7 +91,10 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
             env.data.ctrl.copy() - env.data.qpos[: env.arm_dofs].copy()
         )
         unsafe_contacts.extend(_unsafe_contact_pairs(env))
-        if len(env.completed_parts) == len(env.part_order) and env.controller_phase == "idle":
+        if (
+            len(env.completed_parts) == len(env.active_part_order)
+            and env.controller_phase == "idle"
+        ):
             completed = True
             break
 
