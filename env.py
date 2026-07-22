@@ -124,7 +124,7 @@ class FactoryFloorEnv:
         # Position-only IK treats wrist orientation as an independent tool
         # servo. The visible fixed-length gripper rotates between audited pick
         # and bin vectors while its base follows the UR attachment site.
-        self.gripper_bin_vector = np.array([0.14, 0.15, -0.10], dtype=float)
+        self.gripper_bin_vector = np.array([0.20, 0.15, -0.10], dtype=float)
         self.gripper_length = float(np.linalg.norm(self.gripper_bin_vector))
         raw_pick_vector = np.array([0.05, -0.16, -0.125], dtype=float)
         self.gripper_pick_vector = (
@@ -429,13 +429,17 @@ class FactoryFloorEnv:
             # Sample across the far table bands. Bin walls remain inside the
             # tabletop, clear of the feed tray, visible, and inside the UR5e's
             # audited approach corridor.
-            positive_center = self.random_state.uniform([0.62, 0.13], [0.64, 0.14])
-            negative_center = self.random_state.uniform([0.62, 0.39], [0.64, 0.40])
+            lower_image_center = self.random_state.uniform(
+                [0.62, 0.10], [0.70, 0.16]
+            )
+            upper_image_center = self.random_state.uniform(
+                [0.62, 0.40], [0.70, 0.46]
+            )
             self.model.body_pos[self.bin_body_ids["bin_0"], :2] += (
-                positive_center - np.array([0.70, 0.26])
+                lower_image_center - np.array([0.70, 0.26])
             )
             self.model.body_pos[self.bin_body_ids["bin_1"], :2] += (
-                negative_center - np.array([0.70, -0.26])
+                upper_image_center - np.array([0.70, -0.26])
             )
 
     def render_rgb(self) -> np.ndarray:

@@ -109,8 +109,9 @@ This gives a presentable robotics baseline now, while leaving extension points f
 
 ## Limitations
 - Pickup is still a scripted attachment rather than a force/contact grasp. The
-  visible fixed-length tool now carries the part to the bin opening, releases
-  it under MuJoCo physics, and credits it only after it lands inside the bin.
+  visible `0.269 m` fixed-length tool now carries the part to the randomized bin
+  opening, releases it under MuJoCo physics, and credits it only after it lands
+  inside the bin.
 - The learned baseline is validated only over the present simulation
   randomization range; real-camera transfer and contact-rich grasping remain
   future work.
