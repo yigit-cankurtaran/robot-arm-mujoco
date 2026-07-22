@@ -131,7 +131,7 @@ def main() -> None:
         description="Headless speed, smoothness, completion, and collision audit."
     )
     parser.add_argument("--seeds", type=int, default=20)
-    parser.add_argument("--max-cycle-time", type=float, default=15.0)
+    parser.add_argument("--max-cycle-time", type=float, default=30.0)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 

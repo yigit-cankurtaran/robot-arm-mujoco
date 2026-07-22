@@ -64,7 +64,9 @@ labels; they are never included in the policy observation.
 ## What This Repo Contains
 
 - `third_party/menagerie/universal_robots_ur5e/workcell_scene.xml`
-  The custom workcell scene. It includes the official UR5e model, a feed tray, two sorting bins, and three loose parts.
+  The custom workcell scene. It includes the official UR5e model, a feed tray,
+  two sorting bins, and eight loose bodies spanning boxes, cylinders, a sphere,
+  a capsule, an ellipsoid, and a brick.
 - `env.py`
   The task environment. It randomizes unlabeled match groups, renders visual observations, and implements the autonomous IK-based sorter.
 - `demo.py`
@@ -80,7 +82,8 @@ labels; they are never included in the policy observation.
 
 ## How The Sorting Demo Works
 
-- Three parts spawn at randomized reachable positions on the tabletop.
+- One to five parts are sampled from eight shapes and spawn at randomized,
+  collision-audited reachable positions on the tabletop.
 - Two distinct colors are sampled continuously on every reset; there are no fixed color classes or names.
 - Each part is randomly assigned to one same-color bin, with both bins guaranteed to receive at least one part.
 - The controller uses inverse kinematics on the UR5e attachment site to move through pick, lift, transfer, and place phases instead of replaying fixed joint-space waypoints.
@@ -91,12 +94,14 @@ The original `demo.py` remains an oracle regression mode. The learned RGB mode
 is available after training:
 
 ```bash
-.venv/bin/mjpython visual_sort_demo.py --checkpoint runs/visual_policy/best.pt
+.venv/bin/mjpython visual_sort_demo.py
 ```
 
 It detects variable-count parts and two bins from RGB, performs relational
 same-color matching without named color classes, estimates workspace targets,
-and hands those targets to the existing classical controller. See the
+and hands those targets to the existing classical controller. It re-observes
+and replans when the controller returns to idle, allowing a temporarily
+occluded or missed part to be recovered. See the
 [learned visual policy guide](docs/learned-visual-policy.md) for reproducible
 generation, training, evaluation, results, and limitations.
 

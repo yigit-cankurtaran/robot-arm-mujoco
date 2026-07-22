@@ -263,6 +263,28 @@ class RGBVisualPolicy:
             self.calibration,
             minimum_area=250,
         )
+        # After a drop, the object remains visible inside its destination bin.
+        # Exclude those regions so closed-loop replanning only returns unsorted
+        # feed objects instead of attempting to pick already sorted pieces.
+        if bins:
+            bin_regions = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            for instance in bins:
+                contours, _ = cv2.findContours(
+                    instance.mask.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )
+                for contour in contours:
+                    x, y, width, height = cv2.boundingRect(contour)
+                    bin_regions[y : y + height, x : x + width] = 1
+            parts = [
+                instance
+                for instance in parts
+                if not bin_regions[
+                    int(round(instance.centroid_xy[1])),
+                    int(round(instance.centroid_xy[0])),
+                ]
+            ]
         picks: list[VisualPick] = []
         if len(bins) == 2:
             for part in parts:
@@ -306,7 +328,10 @@ def extract_instances(
 ) -> list[VisualInstance]:
     mask_u8 = binary_mask.astype(np.uint8)
     kernel = np.ones((3, 3), dtype=np.uint8)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # Closing is useful for the five-piece bin silhouette, but can merge two
+    # neighboring loose parts into one instance in denser scenes.
+    if kind == "bin":
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, 8)
     instances: list[VisualInstance] = []
     for label in range(1, count):

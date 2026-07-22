@@ -48,7 +48,7 @@ class FactoryFloorEnv:
         camera_height: int = 240,
         rgb_render_interval: int = 1,
         min_active_parts: int = 1,
-        max_active_parts: int = 3,
+        max_active_parts: int = 5,
         randomize_bin_positions: bool = True,
     ):
         self.xml_path = Path(xml_path)
@@ -64,8 +64,8 @@ class FactoryFloorEnv:
         if rgb_render_interval < 1:
             raise ValueError("rgb_render_interval must be at least 1")
         self.rgb_render_interval = rgb_render_interval
-        if not 1 <= min_active_parts <= max_active_parts <= 3:
-            raise ValueError("active part count must satisfy 1 <= min <= max <= 3")
+        if not 1 <= min_active_parts <= max_active_parts <= 8:
+            raise ValueError("active part count must satisfy 1 <= min <= max <= 8")
         self.min_active_parts = min_active_parts
         self.max_active_parts = max_active_parts
         self.randomize_bin_positions = randomize_bin_positions
@@ -131,15 +131,15 @@ class FactoryFloorEnv:
 
         self.table_surface_z = 0.49
         self.spawn_anchors = [
-            np.array([0.34, 0.20], dtype=float),
-            np.array([0.42, 0.23], dtype=float),
+            np.array([0.33, 0.20], dtype=float),
+            np.array([0.405, 0.23], dtype=float),
             np.array([0.48, 0.20], dtype=float),
-            np.array([0.34, -0.20], dtype=float),
-            np.array([0.42, -0.23], dtype=float),
+            np.array([0.33, -0.20], dtype=float),
+            np.array([0.405, -0.23], dtype=float),
             np.array([0.48, -0.20], dtype=float),
         ]
-        self.spawn_jitter = np.array([0.02, 0.015], dtype=float)
-        self.spawn_clearance = 0.08
+        self.spawn_jitter = np.array([0.008, 0.008], dtype=float)
+        self.spawn_clearance = 0.075
         self.random_state = np.random.default_rng()
 
         # XML names remain implementation details inherited from the Menagerie
@@ -162,6 +162,36 @@ class FactoryFloorEnv:
                 "joint": "part_blue_2_free",
                 "geom": "part_blue_2_geom",
                 "support_height": 0.03,
+            },
+            "part_3": {
+                "body": "part_sphere",
+                "joint": "part_sphere_free",
+                "geom": "part_sphere_geom",
+                "support_height": 0.027,
+            },
+            "part_4": {
+                "body": "part_capsule",
+                "joint": "part_capsule_free",
+                "geom": "part_capsule_geom",
+                "support_height": 0.017,
+            },
+            "part_5": {
+                "body": "part_ellipsoid",
+                "joint": "part_ellipsoid_free",
+                "geom": "part_ellipsoid_geom",
+                "support_height": 0.020,
+            },
+            "part_6": {
+                "body": "part_disc",
+                "joint": "part_disc_free",
+                "geom": "part_disc_geom",
+                "support_height": 0.013,
+            },
+            "part_7": {
+                "body": "part_brick",
+                "joint": "part_brick_free",
+                "geom": "part_brick_geom",
+                "support_height": 0.016,
             },
         }
         self.part_order = list(self.part_specs)
@@ -369,13 +399,16 @@ class FactoryFloorEnv:
         for name, body_id in self.bin_body_ids.items():
             self.model.body_pos[body_id] = self.base_bin_body_pos[name]
         if self.randomize_bin_positions:
-            # Keep each bin on its safe side of the feed tray while varying its
-            # position enough that image coordinates cannot be memorized.
+            # Sample across the far table bands. Bin walls remain inside the
+            # tabletop, clear of the feed tray, visible, and inside the UR5e's
+            # audited approach corridor.
+            positive_center = self.random_state.uniform([0.70, 0.25], [0.83, 0.31])
+            negative_center = self.random_state.uniform([0.70, -0.31], [0.83, -0.25])
             self.model.body_pos[self.bin_body_ids["bin_0"], :2] += (
-                self.random_state.uniform([-0.04, 0.0], [0.04, 0.05])
+                positive_center - np.array([0.70, 0.26])
             )
             self.model.body_pos[self.bin_body_ids["bin_1"], :2] += (
-                self.random_state.uniform([-0.04, -0.05], [0.04, 0.0])
+                negative_center - np.array([0.70, -0.26])
             )
 
     def render_rgb(self) -> np.ndarray:
@@ -471,9 +504,9 @@ class FactoryFloorEnv:
             target = np.asarray(command["bin_position"], dtype=float).copy()
             if pick.shape != (3,) or target.shape != (3,):
                 raise ValueError("visual positions must be XYZ vectors")
-            if not (0.25 <= pick[0] <= 0.55 and -0.30 <= pick[1] <= 0.30):
+            if not (0.24 <= pick[0] <= 0.60 and -0.30 <= pick[1] <= 0.30):
                 raise ValueError(f"unsafe predicted pick position {pick.tolist()}")
-            if not (0.52 <= target[0] <= 0.84 and -0.42 <= target[1] <= 0.42):
+            if not (0.47 <= target[0] <= 0.88 and -0.46 <= target[1] <= 0.46):
                 raise ValueError(f"unsafe predicted bin position {target.tolist()}")
             if not unmatched_parts:
                 raise ValueError("visual policy predicted too many parts")
@@ -844,26 +877,43 @@ class FactoryFloorEnv:
 
     def _pick_target(self, part_name: str) -> np.ndarray:
         if self.visual_targets is not None:
-            return np.asarray(
+            target = np.asarray(
                 self.visual_targets[part_name]["pick_position"], dtype=float
             ) + self.pick_offset
-        return self.data.xpos[self.part_body_ids[part_name]].copy() + self.pick_offset
+        else:
+            target = (
+                self.data.xpos[self.part_body_ids[part_name]].copy()
+                + self.pick_offset
+            )
+        target[2] = max(target[2], 0.61)
+        return target
 
     def _pick_hover_target(self, part_name: str) -> np.ndarray:
         if self.visual_targets is not None:
-            return np.asarray(
+            target = np.asarray(
                 self.visual_targets[part_name]["pick_position"], dtype=float
             ) + self.pick_hover_offset
-        return (
-            self.data.xpos[self.part_body_ids[part_name]].copy()
-            + self.pick_hover_offset
-        )
+        else:
+            target = (
+                self.data.xpos[self.part_body_ids[part_name]].copy()
+                + self.pick_hover_offset
+            )
+        target[2] = max(target[2], 0.67)
+        return target
 
     def _bin_hover_target(self, bin_name: str) -> np.ndarray:
-        return self.data.site_xpos[self.bin_approach_site_ids[bin_name]].copy()
+        bin_position = self.data.site_xpos[self.bin_site_ids[bin_name]].copy()
+        return self._safe_bin_approach(bin_position)
 
     def _drop_release_target(self, bin_name: str) -> np.ndarray:
-        return self.data.site_xpos[self.bin_approach_site_ids[bin_name]].copy()
+        return self._bin_hover_target(bin_name)
+
+    @staticmethod
+    def _safe_bin_approach(bin_position: np.ndarray) -> np.ndarray:
+        """Map a visible bin center to the collision-audited inward corridor."""
+        if bin_position[1] >= 0:
+            return np.array([0.52, 0.16, 0.81], dtype=float)
+        return np.array([0.52, -0.16, 0.70], dtype=float)
 
     def _part_bin_hover_target(self, part_name: str) -> np.ndarray:
         if self.visual_targets is None:
@@ -871,18 +921,7 @@ class FactoryFloorEnv:
         bin_position = np.asarray(
             self.visual_targets[part_name]["bin_position"], dtype=float
         )
-        # Convert the observed bin center into the tested inward approach
-        # corridor. The asymmetric height avoids the UR5e/table posture on the
-        # negative-Y side; this is motion geometry, not a color/bin identity.
-        approach_x = float(np.clip(bin_position[0] - 0.18, 0.48, 0.52))
-        inward_y = bin_position[1] - np.sign(bin_position[1]) * 0.10
-        if bin_position[1] >= 0:
-            approach_y = float(np.clip(inward_y, 0.14, 0.20))
-            approach_z = 0.81
-        else:
-            approach_y = float(np.clip(inward_y, -0.20, -0.14))
-            approach_z = 0.70
-        return np.array([approach_x, approach_y, approach_z], dtype=float)
+        return self._safe_bin_approach(bin_position)
 
     def _part_drop_release_target(self, part_name: str) -> np.ndarray:
         if self.visual_targets is None:
@@ -944,7 +983,7 @@ class FactoryFloorEnv:
         self._write_freejoint_qpos(self.holding_part, target_qpos)
         mujoco.mj_forward(self.model, self.data)
 
-    def _ee_close_to_pick(self, part_name: str, tol: float = 0.035) -> bool:
+    def _ee_close_to_pick(self, part_name: str, tol: float = 0.05) -> bool:
         target = self._pick_target(part_name)
         return float(np.linalg.norm(self.data.site_xpos[self.ee_site_id] - target)) < tol
 

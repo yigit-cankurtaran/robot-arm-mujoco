@@ -15,8 +15,8 @@ def validated_commands(policy: RGBVisualPolicy, rgb):
     estimate = policy.predict(rgb)
     if len(estimate.bins) != 2:
         raise RuntimeError(f"expected two bins, detected {len(estimate.bins)}")
-    if not 1 <= len(estimate.parts) <= 3:
-        raise RuntimeError(f"expected one-to-three parts, detected {len(estimate.parts)}")
+    if not 1 <= len(estimate.parts) <= 5:
+        raise RuntimeError(f"expected one-to-five parts, detected {len(estimate.parts)}")
     if len(estimate.picks) != len(estimate.parts):
         raise RuntimeError("not every detected part received a bin match")
     for instance in [*estimate.parts, *estimate.bins]:
@@ -42,7 +42,7 @@ def validated_commands(policy: RGBVisualPolicy, rgb):
 def main() -> None:
     parser = argparse.ArgumentParser(description="RGB-only visual sorting demo")
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("runs/visual_policy/best.pt")
+        "--checkpoint", type=Path, default=Path("runs/visual_shapes_policy/best.pt")
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-camera-panel", action="store_true")
@@ -80,6 +80,18 @@ def main() -> None:
                     overlay = draw_task_estimate(
                         result.observation["rgb"], live_estimate
                     )
+                    if env.controller_phase == "idle" and live_estimate.parts:
+                        try:
+                            replanned_estimate, new_commands = validated_commands(
+                                policy, result.observation["rgb"]
+                            )
+                            replanning = env.set_visual_targets(new_commands)
+                            print({"visual_replan": replanning})
+                            overlay = draw_task_estimate(
+                                result.observation["rgb"], replanned_estimate
+                            )
+                        except (RuntimeError, ValueError) as exc:
+                            print(f"Visual replan paused: {exc}")
                 viewer.sync()
                 if camera_panel is not None:
                     if camera_panel.user_requested_close():

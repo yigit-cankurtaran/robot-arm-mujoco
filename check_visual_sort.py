@@ -14,7 +14,7 @@ from visual_sort_demo import validated_commands
 def main() -> None:
     parser = argparse.ArgumentParser(description="Headless end-to-end visual sort check")
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("runs/visual_policy/best.pt")
+        "--checkpoint", type=Path, default=Path("runs/visual_shapes_policy/best.pt")
     )
     parser.add_argument("--seeds", type=int, default=20)
     parser.add_argument("--seed-start", type=int, default=300_000)
@@ -33,6 +33,7 @@ def main() -> None:
             oracle = env.oracle_task_state()
             try:
                 estimate, commands = validated_commands(policy, observation["rgb"])
+                initial_detected_parts = len(estimate.parts)
                 adapter = env.set_visual_targets(commands)
                 # The plan is latched for one motion cycle; avoid paying for
                 # unused camera frames during this headless dynamics check.
@@ -42,6 +43,7 @@ def main() -> None:
                 records.append({"seed": seed, "accepted": False, "error": str(exc)})
                 continue
             steps = 0
+            replans = 0
             while steps < args.max_steps:
                 env.scripted_step()
                 steps += 1
@@ -50,6 +52,15 @@ def main() -> None:
                     and len(env.completed_parts) == len(env.active_part_order)
                 ):
                     break
+                if env.controller_phase == "idle" and replans < 3:
+                    replan_rgb = env.render_rgb()
+                    try:
+                        estimate, commands = validated_commands(policy, replan_rgb)
+                        env.set_visual_targets(commands)
+                        env.rgb_frame_counter = 1
+                        replans += 1
+                    except (RuntimeError, ValueError):
+                        break
             correct_destinations = 0
             for name in env.active_part_order:
                 position = env.data.xpos[env.part_body_ids[name]]
@@ -70,9 +81,10 @@ def main() -> None:
                     "seed": seed,
                     "accepted": True,
                     "truth_parts": len(env.active_part_order),
-                    "detected_parts": len(estimate.parts),
+                    "detected_parts": initial_detected_parts,
                     "steps": steps,
                     "completed": len(env.completed_parts),
+                    "replans": replans,
                     "correct_destinations": correct_destinations,
                     "adapter": adapter,
                 }

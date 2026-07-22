@@ -24,4 +24,3 @@ def test_relational_color_distance_ignores_brightness_scale() -> None:
     different_color = np.array([20, 40, 80], dtype=np.float32)
     assert relational_color_distance(base, darker_same_color) < 1e-6
     assert relational_color_distance(base, different_color) > 0.2
-
