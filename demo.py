@@ -6,6 +6,7 @@ import time
 import mujoco.viewer
 
 from camera_panel import CameraPanelProcess
+from demo_runtime import sort_is_complete, sort_success_message
 from env import FactoryFloorEnv
 
 
@@ -31,6 +32,7 @@ def main() -> None:
                 camera_panel = None
 
         print(env.describe_task())
+        run_started = time.perf_counter()
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.cam.azimuth = 138
             viewer.cam.elevation = -24
@@ -52,6 +54,13 @@ def main() -> None:
                         camera_panel.publish(
                             result.observation["rgb"], env.controller_phase
                         )
+                if sort_is_complete(env):
+                    print(
+                        sort_success_message(
+                            env, time.perf_counter() - run_started
+                        )
+                    )
+                    break
                 remaining = env.control_dt - (time.perf_counter() - start)
                 if remaining > 0:
                     time.sleep(remaining)

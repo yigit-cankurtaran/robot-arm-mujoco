@@ -32,6 +32,10 @@ frame supplied to the future visual policy. The panel runs in a separate process
 so its OpenCV/Cocoa event loop cannot conflict with MuJoCo's GLFW window. Press
 `q` or Escape in that panel to exit. Use `--no-camera-panel` to hide it.
 
+After the final object settles in its bin, the arm returns fully home, prints a
+success line with object count, simulated time, wall time, and throughput, then
+closes both windows and the camera child process automatically.
+
 To test only the isolated camera process for three seconds:
 
 ```bash

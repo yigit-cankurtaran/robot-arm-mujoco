@@ -15,6 +15,18 @@ def test_robotiq_gripper_is_part_of_the_compiled_model() -> None:
         assert env.gripper_actuator_id >= env.arm_dofs
         assert all(actuator_id >= env.arm_dofs for actuator_id in env.gripper_adhesion_actuator_ids)
         assert all(env.gripper_pad_geom_ids.values())
+        visual_spacer_id = mujoco.mj_name2id(
+            env.model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "gripper/mount_spacer_visual",
+        )
+        collision_spacer_id = mujoco.mj_name2id(
+            env.model, mujoco.mjtObj.mjOBJ_GEOM, "gripper/mount_spacer"
+        )
+        assert visual_spacer_id >= 0 and collision_spacer_id >= 0
+        assert env.model.geom_group[visual_spacer_id] == 2
+        assert env.model.geom_contype[visual_spacer_id] == 0
+        assert env.model.geom_conaffinity[visual_spacer_id] == 0
         assert mujoco.mj_id2name(
             env.model, mujoco.mjtObj.mjOBJ_SITE, env.ee_site_id
         ) == "gripper/pinch"

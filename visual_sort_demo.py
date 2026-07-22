@@ -7,6 +7,7 @@ from pathlib import Path
 import mujoco.viewer
 
 from camera_panel import CameraPanelProcess
+from demo_runtime import sort_is_complete, sort_success_message
 from env import FactoryFloorEnv
 from visual_policy import RGBVisualPolicy, draw_task_estimate
 
@@ -69,6 +70,7 @@ def main() -> None:
                 camera_panel.close()
                 camera_panel = None
 
+        run_started = time.perf_counter()
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             viewer.cam.azimuth = 138
             viewer.cam.elevation = -24
@@ -77,10 +79,11 @@ def main() -> None:
             while viewer.is_running():
                 started = time.perf_counter()
                 result = env.scripted_step()
+                completed = sort_is_complete(env)
                 rendered_this_tick = (
                     (env.rgb_frame_counter - 1) % env.rgb_render_interval == 0
                 )
-                if rendered_this_tick:
+                if rendered_this_tick and not completed:
                     live_estimate = policy.predict(result.observation["rgb"])
                     overlay = draw_task_estimate(
                         result.observation["rgb"], live_estimate
@@ -108,6 +111,13 @@ def main() -> None:
                         camera_panel = None
                     else:
                         camera_panel.publish(overlay, env.controller_phase)
+                if completed:
+                    print(
+                        sort_success_message(
+                            env, time.perf_counter() - run_started
+                        )
+                    )
+                    break
                 remaining = env.control_dt - (time.perf_counter() - started)
                 if remaining > 0:
                     time.sleep(remaining)
