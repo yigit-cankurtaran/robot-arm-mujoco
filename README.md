@@ -108,7 +108,9 @@ generation, training, evaluation, results, and limitations.
 This gives a presentable robotics baseline now, while leaving extension points for perception, grasp planning, scheduling, or learning later.
 
 ## Limitations
-- Grasping is still simplified as a scripted attachment to the end-effector site rather than a contact-rich gripper model.
+- Pickup is still a scripted attachment rather than a force/contact grasp. The
+  visible fixed-length tool now carries the part to the bin opening, releases
+  it under MuJoCo physics, and credits it only after it lands inside the bin.
 - The learned baseline is validated only over the present simulation
   randomization range; real-camera transfer and contact-rich grasping remain
   future work.

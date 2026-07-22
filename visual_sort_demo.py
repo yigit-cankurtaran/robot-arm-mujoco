@@ -42,7 +42,9 @@ def validated_commands(policy: RGBVisualPolicy, rgb):
 def main() -> None:
     parser = argparse.ArgumentParser(description="RGB-only visual sorting demo")
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("runs/visual_shapes_policy/best.pt")
+        "--checkpoint",
+        type=Path,
+        default=Path("runs/visual_physical_release_separated_policy/best.pt"),
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-camera-panel", action="store_true")

@@ -14,7 +14,9 @@ from visual_sort_demo import validated_commands
 def main() -> None:
     parser = argparse.ArgumentParser(description="Headless end-to-end visual sort check")
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("runs/visual_shapes_policy/best.pt")
+        "--checkpoint",
+        type=Path,
+        default=Path("runs/visual_physical_release_separated_policy/best.pt"),
     )
     parser.add_argument("--seeds", type=int, default=20)
     parser.add_argument("--seed-start", type=int, default=300_000)

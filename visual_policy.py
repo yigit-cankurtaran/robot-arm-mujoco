@@ -328,23 +328,64 @@ def extract_instances(
 ) -> list[VisualInstance]:
     mask_u8 = binary_mask.astype(np.uint8)
     kernel = np.ones((3, 3), dtype=np.uint8)
-    # Closing is useful for the five-piece bin silhouette, but can merge two
-    # neighboring loose parts into one instance in denser scenes.
-    if kind == "bin":
-        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
-    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, 8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, 8)
+    components = [
+        labels == label
+        for label in range(1, count)
+        if int(stats[label, cv2.CC_STAT_AREA]) >= minimum_area
+    ]
+    if kind == "bin" and len(components) == 1:
+        # The two bin predictions sometimes share a narrow semantic bridge at
+        # their adjacent shadows. The task guarantees exactly two bins, so use
+        # deterministic spatial two-means to recover the two instances without
+        # relying on their colors or simulator coordinates.
+        joined = components[0]
+        coordinates_yx = np.column_stack(np.nonzero(joined)).astype(np.float32)
+        centered = coordinates_yx - coordinates_yx.mean(axis=0, keepdims=True)
+        _, _, axes = np.linalg.svd(centered, full_matrices=False)
+        projection = centered @ axes[0]
+        centers = np.stack(
+            [
+                coordinates_yx[int(np.argmin(projection))],
+                coordinates_yx[int(np.argmax(projection))],
+            ]
+        )
+        assignments = np.zeros(len(coordinates_yx), dtype=np.int64)
+        for _ in range(12):
+            distances = np.linalg.norm(
+                coordinates_yx[:, None, :] - centers[None, :, :], axis=2
+            )
+            new_assignments = distances.argmin(axis=1)
+            if np.array_equal(new_assignments, assignments):
+                break
+            assignments = new_assignments
+            for cluster_index in range(2):
+                cluster = coordinates_yx[assignments == cluster_index]
+                if len(cluster):
+                    centers[cluster_index] = cluster.mean(axis=0)
+        components = []
+        integer_coordinates = coordinates_yx.astype(np.int64)
+        for cluster_index in range(2):
+            component = np.zeros_like(joined)
+            cluster_coordinates = integer_coordinates[
+                assignments == cluster_index
+            ]
+            component[cluster_coordinates[:, 0], cluster_coordinates[:, 1]] = True
+            if int(component.sum()) >= minimum_area:
+                components.append(component)
+
     instances: list[VisualInstance] = []
-    for label in range(1, count):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        if area < minimum_area:
-            continue
-        component = labels == label
+    for component in components:
         color_mask = cv2.erode(component.astype(np.uint8), kernel, iterations=1).astype(bool)
         if not color_mask.any():
             color_mask = component
         pixels = rgb[color_mask]
         mean_rgb = np.median(pixels, axis=0).astype(np.float32)
-        centroid = (float(centroids[label, 0]), float(centroids[label, 1]))
+        coordinates_yx = np.column_stack(np.nonzero(component))
+        centroid = (
+            float(coordinates_yx[:, 1].mean()),
+            float(coordinates_yx[:, 0].mean()),
+        )
         instances.append(
             VisualInstance(
                 kind=kind,

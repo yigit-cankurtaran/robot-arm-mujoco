@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-3)
+    parser.add_argument(
+        "--initial-checkpoint",
+        type=Path,
+        help="optional compatible checkpoint for fine-tuning",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
@@ -132,6 +137,11 @@ def main() -> None:
         val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0
     )
     model = TinyUNet(args.base_channels).to(device)
+    if args.initial_checkpoint is not None:
+        initial_payload = torch.load(
+            args.initial_checkpoint, map_location=device, weights_only=False
+        )
+        model.load_state_dict(initial_payload["model_state"])
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
     config = {
@@ -140,6 +150,9 @@ def main() -> None:
         "train_data": str(args.train_data),
         "val_data": str(args.val_data),
         "seed": args.seed,
+        "initial_checkpoint": (
+            str(args.initial_checkpoint) if args.initial_checkpoint is not None else None
+        ),
     }
     history: list[dict[str, float]] = []
     best_iou = -1.0
@@ -187,4 +200,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
