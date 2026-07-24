@@ -145,6 +145,13 @@ class FactoryFloorEnv:
         # continuous minimum-jerk polynomial's analytical peak.
         self.trajectory_jerk_margin = 0.55
         self.min_trajectory_duration = 0.24
+        # Loaded motion is intentionally slower than unloaded minimum-jerk
+        # motion. These scales are benchmarked independently so speed tuning
+        # never has to weaken the underlying velocity/acceleration/jerk limits.
+        self.transfer_duration_scale = 2.35
+        self.bin_hover_duration_scale = 3.0
+        self.single_part_transfer_duration_scale = 2.0
+        self.single_part_bin_hover_duration_scale = 2.4
 
         self.ik_iterations = 32
         self.ik_damping = 0.08
@@ -705,6 +712,17 @@ class FactoryFloorEnv:
             # the known joint posture prevents the next pick from starting on
             # a table-facing IK branch.
             target_q = self.home_ctrl.copy()
+        elif (
+            self.trajectory_phase == self.controller_phase
+            and not self._trajectory_complete()
+        ):
+            # The minimum-jerk goal is latched for the duration of a segment.
+            # Re-solving identical Cartesian IK on every intermediate tick
+            # cannot change the command, so reuse the goal until the segment
+            # completes. A moving/settling target is solved again at the
+            # endpoint and `_trajectory_command()` starts a smooth correction
+            # if it drifted materially.
+            target_q = self.trajectory_goal.copy()
         else:
             target_q = self._solve_inverse_kinematics(target_pos)
         smooth_target_q = self._trajectory_command(target_q)
@@ -761,12 +779,22 @@ class FactoryFloorEnv:
                     float(np.max(jerk_time)),
                 )
                 if self.controller_phase == "move_to_bin_hover":
-                    self.trajectory_duration *= 3.0
+                    scale = (
+                        self.single_part_bin_hover_duration_scale
+                        if len(self.active_part_order) == 1
+                        else self.bin_hover_duration_scale
+                    )
+                    self.trajectory_duration *= scale
                 elif self.controller_phase == "move_to_transfer":
                     # This phase also rotates from the pick attitude to the bin
                     # attitude. Slow it under load so rounded parts do not gain
                     # enough lateral momentum to slide out of the real pads.
-                    self.trajectory_duration *= 2.5
+                    scale = (
+                        self.single_part_transfer_duration_scale
+                        if len(self.active_part_order) == 1
+                        else self.transfer_duration_scale
+                    )
+                    self.trajectory_duration *= scale
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration

@@ -25,9 +25,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # A 25 Hz camera is ample for the visual matcher and leaves the 50 Hz arm
-    # controller enough rendering headroom for a smooth interactive demo.
-    env = FactoryFloorEnv(rgb_render_interval=2)
+    # The oracle overlay is diagnostic only. A 12.5 Hz camera keeps boxes and
+    # arrows responsive while leaving the 50 Hz physics loop more wall-clock
+    # headroom on machines where offscreen rendering is expensive.
+    env = FactoryFloorEnv(rgb_render_interval=4)
     camera_panel = None if args.no_camera_panel else CameraPanelProcess()
     try:
         if camera_panel is not None:

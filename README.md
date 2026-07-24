@@ -66,6 +66,16 @@ Run the deterministic headless motion audit after controller or scene changes:
 It checks full-cycle completion and timing, commanded joint velocity,
 acceleration and jerk, tracking error, and robot contacts with the workcell.
 
+Run the accuracy-gated speed benchmark after performance changes:
+
+```bash
+.venv/bin/python benchmark_controller.py
+```
+
+The fixed suite covers seven single-shape seeds and four mixed three-part seeds.
+All previously successful cases must remain complete and collision-free. Use
+`--quick` for one single and one mixed smoke case.
+
 Check randomized colors, hidden matching assignments, and rendered observations:
 
 ```bash
