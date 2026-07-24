@@ -150,6 +150,11 @@ class FactoryFloorEnv:
         # never has to weaken the underlying velocity/acceleration/jerk limits.
         self.transfer_duration_scale = 2.35
         self.bin_hover_duration_scale = 3.0
+        # Flat-sided and upright, axisymmetric parts remain well constrained
+        # between the pads and can tolerate a modestly quicker loaded motion.
+        # Rounded/low-profile parts keep the conservative default above.
+        self.stable_part_transfer_duration_scale = 2.2
+        self.stable_part_bin_hover_duration_scale = 2.7
         self.single_part_transfer_duration_scale = 2.0
         self.single_part_bin_hover_duration_scale = 2.4
 
@@ -223,48 +228,56 @@ class FactoryFloorEnv:
                 "joint": "part_blue_1_free",
                 "geom": "part_blue_1_geom",
                 "support_height": 0.025,
+                "motion_profile": "stable",
             },
             "part_1": {
                 "body": "part_orange_1",
                 "joint": "part_orange_1_free",
                 "geom": "part_orange_1_geom",
                 "support_height": 0.03,
+                "motion_profile": "stable",
             },
             "part_2": {
                 "body": "part_blue_2",
                 "joint": "part_blue_2_free",
                 "geom": "part_blue_2_geom",
                 "support_height": 0.03,
+                "motion_profile": "stable",
             },
             "part_3": {
                 "body": "part_sphere",
                 "joint": "part_sphere_free",
                 "geom": "part_sphere_geom",
                 "support_height": 0.027,
+                "motion_profile": "cautious",
             },
             "part_4": {
                 "body": "part_capsule",
                 "joint": "part_capsule_free",
                 "geom": "part_capsule_geom",
                 "support_height": 0.017,
+                "motion_profile": "cautious",
             },
             "part_5": {
                 "body": "part_ellipsoid",
                 "joint": "part_ellipsoid_free",
                 "geom": "part_ellipsoid_geom",
                 "support_height": 0.020,
+                "motion_profile": "cautious",
             },
             "part_6": {
                 "body": "part_disc",
                 "joint": "part_disc_free",
                 "geom": "part_disc_geom",
                 "support_height": 0.013,
+                "motion_profile": "cautious",
             },
             "part_7": {
                 "body": "part_brick",
                 "joint": "part_brick_free",
                 "geom": "part_brick_geom",
                 "support_height": 0.016,
+                "motion_profile": "stable",
             },
         }
         self.part_order = list(self.part_specs)
@@ -395,6 +408,9 @@ class FactoryFloorEnv:
         self.completed_parts: set[str] = set()
         self.controller_phase = "idle"
         self.last_pick_hover_target = self.home_ee_target.copy()
+        # Returning most of the way along the known-safe home trajectory clears
+        # the bin, but the next pick may start before exact home convergence.
+        self.inter_pick_home_fraction = 0.9
         self.spawn_layout: dict[str, np.ndarray] = {}
 
         self.trajectory_phase: str | None = None
@@ -779,22 +795,16 @@ class FactoryFloorEnv:
                     float(np.max(jerk_time)),
                 )
                 if self.controller_phase == "move_to_bin_hover":
-                    scale = (
-                        self.single_part_bin_hover_duration_scale
-                        if len(self.active_part_order) == 1
-                        else self.bin_hover_duration_scale
+                    self.trajectory_duration *= self._loaded_motion_scale(
+                        "bin_hover"
                     )
-                    self.trajectory_duration *= scale
                 elif self.controller_phase == "move_to_transfer":
                     # This phase also rotates from the pick attitude to the bin
                     # attitude. Slow it under load so rounded parts do not gain
                     # enough lateral momentum to slide out of the real pads.
-                    scale = (
-                        self.single_part_transfer_duration_scale
-                        if len(self.active_part_order) == 1
-                        else self.transfer_duration_scale
+                    self.trajectory_duration *= self._loaded_motion_scale(
+                        "transfer"
                     )
-                    self.trajectory_duration *= scale
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration
@@ -804,6 +814,30 @@ class FactoryFloorEnv:
         return self.trajectory_start + blend * (
             self.trajectory_goal - self.trajectory_start
         )
+
+    def _loaded_motion_scale(self, motion: str) -> float:
+        """Choose audited loaded timing from crowding and held-part stability."""
+        if motion not in {"transfer", "bin_hover"}:
+            raise ValueError(f"unknown loaded motion {motion!r}")
+
+        if len(self.active_part_order) == 1:
+            if motion == "transfer":
+                return self.single_part_transfer_duration_scale
+            return self.single_part_bin_hover_duration_scale
+
+        part_name = self.holding_part or self.active_part
+        profile = (
+            self.part_specs[part_name]["motion_profile"]
+            if part_name is not None
+            else "cautious"
+        )
+        if profile == "stable":
+            if motion == "transfer":
+                return self.stable_part_transfer_duration_scale
+            return self.stable_part_bin_hover_duration_scale
+        if motion == "transfer":
+            return self.transfer_duration_scale
+        return self.bin_hover_duration_scale
 
     def _trajectory_complete(self) -> bool:
         return self.trajectory_elapsed >= self.trajectory_duration
@@ -1001,23 +1035,44 @@ class FactoryFloorEnv:
                     self.completed_parts.add(self.released_part)
                     self.released_part = None
                     self.released_target_bin = None
-                    self.active_part = None
-                    self.last_pick_hover_target = self.home_ee_target.copy()
-                    self.controller_phase = "return_home"
+                    next_part = self._choose_next_part()
+                    if next_part is None:
+                        self.active_part = None
+                        self.last_pick_hover_target = self.home_ee_target.copy()
+                        self.controller_phase = "return_home"
+                    else:
+                        self.active_part = next_part
+                        self.last_pick_hover_target = self._pick_hover_target(
+                            next_part
+                        )
+                        self.controller_phase = "return_home"
                 elif self.drop_settle_elapsed >= self.drop_settle_timeout:
                     # Stay visibly failed instead of crediting a missed drop.
                     self.controller_phase = "drop_failed"
             return
 
         if self.controller_phase == "return_home":
+            if (
+                self.active_part is not None
+                and self.trajectory_phase == "return_home"
+                and self.trajectory_elapsed
+                >= self.inter_pick_home_fraction * self.trajectory_duration
+            ):
+                self.controller_phase = "move_to_pick_hover"
+                return
             if self._trajectory_complete() and self._ee_close_to_position(
                 self.home_ee_target, self.home_position_tol
             ) and float(
                 np.max(np.abs(self.data.qpos[: self.arm_dofs] - self.home_ctrl))
             ) < 0.04:
                 self.controller_phase = (
-                    "select_part" if self._choose_next_part() is not None else "idle"
+                    "move_to_pick_hover"
+                    if self.active_part is not None
+                    else "select_part"
+                    if self._choose_next_part() is not None
+                    else "idle"
                 )
+            return
 
         if self.controller_phase == "grasp_failed":
             self.holding_part = None
