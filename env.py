@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import colorsys
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,11 @@ class FactoryFloorEnv:
         )
         self.data = mujoco.MjData(self.model)
         self.ik_data = mujoco.MjData(self.model)
+        # Route previews use an independent model so collision masks can omit
+        # loose parts without changing the physical simulation.  Copying the
+        # compiled model is inexpensive and preserves all numeric IDs.
+        self.collision_model = copy.copy(self.model)
+        self.collision_data = mujoco.MjData(self.collision_model)
         self.enable_rgb_observation = enable_rgb_observation
         self.camera_width = camera_width
         self.camera_height = camera_height
@@ -173,6 +179,19 @@ class FactoryFloorEnv:
         self.gripper_pick_direction = raw_pick_direction / np.linalg.norm(
             raw_pick_direction
         )
+        self.pick_direction_candidates = [
+            direction / np.linalg.norm(direction)
+            for direction in (
+                np.array([0.05, -0.16, -0.125], dtype=float),
+                np.array([0.05, -0.14, -0.125], dtype=float),
+                np.array([0.05, -0.12, -0.125], dtype=float),
+                np.array([0.05, -0.10, -0.125], dtype=float),
+                np.array([0.02, -0.14, -0.125], dtype=float),
+                np.array([0.08, -0.14, -0.125], dtype=float),
+            )
+        ]
+        self.active_pick_direction = self.gripper_pick_direction.copy()
+        self.active_pick_direction_index = 0
         raw_bin_direction = np.array([0.628, 0.736, -0.254], dtype=float)
         self.gripper_bin_direction = raw_bin_direction / np.linalg.norm(
             raw_bin_direction
@@ -236,6 +255,10 @@ class FactoryFloorEnv:
                 "geom": "part_orange_1_geom",
                 "support_height": 0.03,
                 "motion_profile": "stable",
+                # This tall cylinder has a narrow pad contact patch. Even
+                # without neighboring clutter it needs the cautious transfer
+                # scale to avoid slowly walking out of the physical grasp.
+                "single_transfer_scale": 2.1,
             },
             "part_2": {
                 "body": "part_blue_2",
@@ -357,6 +380,8 @@ class FactoryFloorEnv:
         # creates permanent false contacts with its collision capsules.
         self.model.geom_contype[pedestal_geom_id] = 0
         self.model.geom_conaffinity[pedestal_geom_id] = 0
+        self.collision_model.geom_contype[pedestal_geom_id] = 0
+        self.collision_model.geom_conaffinity[pedestal_geom_id] = 0
         self.part_body_ids = {
             name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, spec["body"])
             for name, spec in self.part_specs.items()
@@ -386,10 +411,46 @@ class FactoryFloorEnv:
             )
             for name, geom_id in self.part_geom_ids.items()
         }
+        # A pick-route preview answers whether the arm itself clears the
+        # workcell. Loose objects are dynamic obstacles whose frozen poses are
+        # not meaningful along a hypothetical sweep, and the ellipsoid can
+        # make MuJoCo's convex solver spend seconds resolving deep preview-only
+        # overlaps. The live simulation still retains every part collision.
+        for geom_id in self.part_geom_ids.values():
+            self.collision_model.geom_contype[geom_id] = 0
+            self.collision_model.geom_conaffinity[geom_id] = 0
+        # Contact-free commanded geometry is not enough for a torque-driven
+        # arm: tracking lag can cut a corner by a few millimetres. Inflating
+        # only the preview model turns that uncertainty into a planning margin
+        # without changing any live contact dynamics.
+        self.route_collision_margin = 0.008
         self.bin_geom_ids = {
             "bin_0": self._body_geom_ids("blue_bin"),
             "bin_1": self._body_geom_ids("orange_bin"),
         }
+        self.robot_root_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "base"
+        )
+        self.gripper_root_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper/base_mount"
+        )
+        clearance_geoms = [
+            mujoco.mj_name2id(
+                self.collision_model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                "table_top",
+            ),
+            *(
+                geom_id
+                for geom_ids in self.bin_geom_ids.values()
+                for geom_id in geom_ids
+            ),
+        ]
+        for geom_id in clearance_geoms:
+            self.collision_model.geom_margin[geom_id] = max(
+                self.collision_model.geom_margin[geom_id],
+                self.route_collision_margin,
+            )
         self.bin_colors: dict[str, np.ndarray] = {}
         self.part_colors: dict[str, np.ndarray] = {}
 
@@ -410,12 +471,28 @@ class FactoryFloorEnv:
         self.last_pick_hover_target = self.home_ee_target.copy()
         # Returning most of the way along the known-safe home trajectory clears
         # the bin, but the next pick may start before exact home convergence.
-        self.inter_pick_home_fraction = 0.9
+        self.inter_pick_home_fraction = 0.8
+        self.force_full_home_for_pick = False
+        self.route_retry_from_home = False
+        self.route_preflight_checks = 0
+        self.route_preflight_rejections = 0
         self.spawn_layout: dict[str, np.ndarray] = {}
 
         self.trajectory_phase: str | None = None
         self.trajectory_start = self.home_ctrl.copy()
         self.trajectory_goal = self.home_ctrl.copy()
+        self.trajectory_start_velocity = np.zeros(self.arm_dofs, dtype=float)
+        self.trajectory_start_acceleration = np.zeros(
+            self.arm_dofs, dtype=float
+        )
+        self.trajectory_velocity = np.zeros(self.arm_dofs, dtype=float)
+        self.trajectory_acceleration = np.zeros(self.arm_dofs, dtype=float)
+        self.trajectory_coefficients = np.vstack(
+            (
+                self.home_ctrl.copy(),
+                np.zeros((5, self.arm_dofs), dtype=float),
+            )
+        )
         self.trajectory_elapsed = 0.0
         self.trajectory_duration = self.min_trajectory_duration
         self.contact_pairs_this_step: set[tuple[int, int]] = set()
@@ -620,6 +697,12 @@ class FactoryFloorEnv:
         self.visual_targets = None
         self.controller_phase = "select_part"
         self.last_pick_hover_target = self.home_ee_target.copy()
+        self.active_pick_direction = self.gripper_pick_direction.copy()
+        self.active_pick_direction_index = 0
+        self.force_full_home_for_pick = False
+        self.route_retry_from_home = False
+        self.route_preflight_checks = 0
+        self.route_preflight_rejections = 0
         self._reset_joint_trajectory()
         self.rgb_frame_counter = 0
         self.last_rgb = None
@@ -723,6 +806,7 @@ class FactoryFloorEnv:
             "return_home",
             "drop_failed",
             "grasp_failed",
+            "route_failed",
         }:
             # Cartesian position alone has several UR5e solutions. Returning to
             # the known joint posture prevents the next pick from starting on
@@ -740,7 +824,15 @@ class FactoryFloorEnv:
             # if it drifted materially.
             target_q = self.trajectory_goal.copy()
         else:
-            target_q = self._solve_inverse_kinematics(target_pos)
+            target_q = (
+                self._select_collision_free_pick_target(target_pos)
+                if self.controller_phase
+                in {"move_to_pick_hover", "move_to_pick"}
+                else self._solve_inverse_kinematics(target_pos)
+            )
+            if target_q is None:
+                self._handle_blocked_pick_route()
+                target_q = self.home_ctrl.copy()
         smooth_target_q = self._trajectory_command(target_q)
         self.set_arm_configuration(smooth_target_q)
         self._advance_controller_state()
@@ -757,11 +849,18 @@ class FactoryFloorEnv:
         self.trajectory_phase = None
         self.trajectory_start = current.copy()
         self.trajectory_goal = current.copy()
+        self.trajectory_start_velocity[:] = 0.0
+        self.trajectory_start_acceleration[:] = 0.0
+        self.trajectory_velocity[:] = 0.0
+        self.trajectory_acceleration[:] = 0.0
+        self.trajectory_coefficients = np.vstack(
+            (current.copy(), np.zeros((5, self.arm_dofs), dtype=float))
+        )
         self.trajectory_elapsed = 0.0
         self.trajectory_duration = self.min_trajectory_duration
 
     def _trajectory_command(self, target_q: np.ndarray) -> np.ndarray:
-        """Return a speed-limited C2-continuous joint command for this phase."""
+        """Return a limit-checked C2-continuous joint command for this phase."""
         target_q = np.clip(target_q, self.ctrl_low, self.ctrl_high)
         target_drifted = bool(
             self._trajectory_complete()
@@ -771,11 +870,17 @@ class FactoryFloorEnv:
             self.trajectory_phase = self.controller_phase
             self.trajectory_start = self.data.ctrl[: self.arm_dofs].copy()
             self.trajectory_goal = target_q.copy()
+            self.trajectory_start_velocity = self.trajectory_velocity.copy()
+            self.trajectory_start_acceleration = (
+                self.trajectory_acceleration.copy()
+            )
             self.trajectory_elapsed = 0.0
             delta = np.abs(self.trajectory_goal - self.trajectory_start)
 
-            # Extrema for p(s)=10s^3-15s^4+6s^5 are 1.875 velocity,
-            # 5.7735 acceleration, and 60 jerk (with unit duration).
+            # These rest-to-rest extrema provide a good initial duration.
+            # A general boundary-conditioned quintic is then checked below
+            # because a mid-motion replan can start with nonzero velocity and
+            # acceleration.
             velocity_time = 1.875 * delta / self.max_joint_velocity
             acceleration_time = np.sqrt(
                 5.7735 * delta / self.max_joint_acceleration
@@ -785,35 +890,349 @@ class FactoryFloorEnv:
                 * delta
                 / (self.trajectory_jerk_margin * self.max_joint_jerk)
             )
-            if float(np.max(delta)) < 1e-6:
+            stationary = bool(
+                float(np.max(delta)) < 1e-6
+                and float(np.max(np.abs(self.trajectory_start_velocity)))
+                < 1e-6
+                and float(
+                    np.max(np.abs(self.trajectory_start_acceleration))
+                )
+                < 1e-6
+            )
+            if stationary:
                 self.trajectory_duration = self.control_dt
+                self.trajectory_coefficients = (
+                    self._quintic_coefficients(self.trajectory_duration)
+                )
             else:
-                self.trajectory_duration = max(
+                initial_duration = max(
                     self.min_trajectory_duration,
                     float(np.max(velocity_time)),
                     float(np.max(acceleration_time)),
                     float(np.max(jerk_time)),
                 )
                 if self.controller_phase == "move_to_bin_hover":
-                    self.trajectory_duration *= self._loaded_motion_scale(
+                    initial_duration *= self._loaded_motion_scale(
                         "bin_hover"
                     )
                 elif self.controller_phase == "move_to_transfer":
                     # This phase also rotates from the pick attitude to the bin
                     # attitude. Slow it under load so rounded parts do not gain
                     # enough lateral momentum to slide out of the real pads.
-                    self.trajectory_duration *= self._loaded_motion_scale(
+                    initial_duration *= self._loaded_motion_scale(
                         "transfer"
                     )
+                (
+                    self.trajectory_duration,
+                    self.trajectory_coefficients,
+                ) = self._limit_checked_trajectory(initial_duration)
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration
         )
-        s = self.trajectory_elapsed / self.trajectory_duration
-        blend = 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
-        return self.trajectory_start + blend * (
-            self.trajectory_goal - self.trajectory_start
+        (
+            command,
+            self.trajectory_velocity,
+            self.trajectory_acceleration,
+            _,
+        ) = self._quintic_state(
+            self.trajectory_coefficients,
+            self.trajectory_duration,
+            self.trajectory_elapsed,
         )
+        return command
+
+    def _quintic_coefficients(self, duration: float) -> np.ndarray:
+        """Build normalized-time coefficients for the current boundaries."""
+        coefficients = np.zeros((6, self.arm_dofs), dtype=float)
+        coefficients[0] = self.trajectory_start
+        coefficients[1] = self.trajectory_start_velocity * duration
+        coefficients[2] = (
+            0.5 * self.trajectory_start_acceleration * duration**2
+        )
+        remaining_position = self.trajectory_goal - np.sum(
+            coefficients[:3], axis=0
+        )
+        remaining_velocity = -coefficients[1] - 2.0 * coefficients[2]
+        remaining_acceleration = -2.0 * coefficients[2]
+        boundary_matrix = np.array(
+            [
+                [1.0, 1.0, 1.0],
+                [3.0, 4.0, 5.0],
+                [6.0, 12.0, 20.0],
+            ],
+            dtype=float,
+        )
+        coefficients[3:] = np.linalg.solve(
+            boundary_matrix,
+            np.vstack(
+                (
+                    remaining_position,
+                    remaining_velocity,
+                    remaining_acceleration,
+                )
+            ),
+        )
+        return coefficients
+
+    def _quintic_state(
+        self,
+        coefficients: np.ndarray,
+        duration: float,
+        elapsed: float | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Evaluate position through jerk for normalized quintic coefficients."""
+        times = np.atleast_1d(np.asarray(elapsed, dtype=float))
+        s = np.clip(times / duration, 0.0, 1.0)[:, None]
+        position = sum(coefficients[degree] * s**degree for degree in range(6))
+        velocity = sum(
+            degree * coefficients[degree] * s ** (degree - 1)
+            for degree in range(1, 6)
+        ) / duration
+        acceleration = sum(
+            degree
+            * (degree - 1)
+            * coefficients[degree]
+            * s ** (degree - 2)
+            for degree in range(2, 6)
+        ) / duration**2
+        jerk = sum(
+            degree
+            * (degree - 1)
+            * (degree - 2)
+            * coefficients[degree]
+            * s ** (degree - 3)
+            for degree in range(3, 6)
+        ) / duration**3
+        if np.ndim(elapsed) == 0:
+            return position[0], velocity[0], acceleration[0], jerk[0]
+        return position, velocity, acceleration, jerk
+
+    def _limit_checked_trajectory(
+        self, initial_duration: float
+    ) -> tuple[float, np.ndarray]:
+        """Expand duration until the full polynomial respects every limit."""
+        duration = max(initial_duration, self.control_dt)
+        for _ in range(40):
+            coefficients = self._quintic_coefficients(duration)
+            sample_count = max(
+                257,
+                int(np.ceil(duration / self.control_dt)) * 4 + 1,
+            )
+            elapsed = np.linspace(0.0, duration, sample_count)
+            _, velocity, acceleration, jerk = self._quintic_state(
+                coefficients, duration, elapsed
+            )
+            if (
+                np.all(
+                    np.max(np.abs(velocity), axis=0)
+                    <= self.max_joint_velocity
+                )
+                and np.all(
+                    np.max(np.abs(acceleration), axis=0)
+                    <= self.max_joint_acceleration
+                )
+                and np.all(
+                    np.max(np.abs(jerk), axis=0)
+                    <= self.trajectory_jerk_margin * self.max_joint_jerk
+                )
+            ):
+                return duration, coefficients
+            duration *= 1.12
+        raise RuntimeError("unable to construct a limit-compliant trajectory")
+
+    def _reset_active_pick_direction(self) -> None:
+        self.active_pick_direction = self.gripper_pick_direction.copy()
+        self.active_pick_direction_index = 0
+        self.force_full_home_for_pick = False
+        self.route_retry_from_home = False
+
+    def _select_collision_free_pick_target(
+        self, target_pos: np.ndarray
+    ) -> np.ndarray | None:
+        """Choose the first pick attitude whose full joint sweep is safe."""
+        directions = [self.active_pick_direction, *self.pick_direction_candidates]
+        tried: list[np.ndarray] = []
+        for direction in directions:
+            if any(np.allclose(direction, previous) for previous in tried):
+                continue
+            tried.append(direction)
+            self.active_pick_direction = direction.copy()
+            target_q = self._solve_inverse_kinematics(target_pos)
+            self.route_preflight_checks += 1
+            if (
+                self._ik_solution_reaches_target(target_q, target_pos)
+                and self._target_trajectory_is_collision_free(target_q)
+            ):
+                self.active_pick_direction_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(
+                            self.pick_direction_candidates
+                        )
+                        if np.allclose(candidate, direction)
+                    ),
+                    -1,
+                )
+                self.route_retry_from_home = False
+                return target_q
+            self.route_preflight_rejections += 1
+        self.active_pick_direction = self.gripper_pick_direction.copy()
+        self.active_pick_direction_index = 0
+        return None
+
+    def _ik_solution_reaches_target(
+        self,
+        target_q: np.ndarray,
+        target_pos: np.ndarray,
+    ) -> bool:
+        """Reject a collision-free IK result that stopped at a joint limit."""
+        self.ik_data.qpos[:] = self.data.qpos
+        self.ik_data.qvel[:] = 0.0
+        self.ik_data.qpos[: self.arm_dofs] = target_q
+        mujoco.mj_kinematics(self.model, self.ik_data)
+        position_error = float(
+            np.linalg.norm(
+                self.ik_data.site_xpos[self.ee_site_id] - target_pos
+            )
+        )
+        # Oracle control uses the tighter 2.5 cm motion tolerance. Pixel-based
+        # commands retain their calibrated perception allowance.
+        allowed_error = max(
+            4.0 * self.ik_tolerance,
+            0.75 * self._motion_position_tolerance(),
+        )
+        return position_error <= allowed_error
+
+    def _handle_blocked_pick_route(self) -> None:
+        """Fall back to exact home once, then stop if no safe sweep exists."""
+        if self.route_retry_from_home:
+            self.controller_phase = "route_failed"
+            return
+        self.force_full_home_for_pick = True
+        self.controller_phase = "return_home"
+
+    def _target_trajectory_is_collision_free(
+        self, target_q: np.ndarray
+    ) -> bool:
+        """Preview a proposed segment without changing real simulation state."""
+        snapshot = (
+            self.trajectory_phase,
+            self.trajectory_start.copy(),
+            self.trajectory_goal.copy(),
+            self.trajectory_start_velocity.copy(),
+            self.trajectory_start_acceleration.copy(),
+            self.trajectory_velocity.copy(),
+            self.trajectory_acceleration.copy(),
+            self.trajectory_coefficients.copy(),
+            self.trajectory_elapsed,
+            self.trajectory_duration,
+        )
+        try:
+            self._trajectory_command(target_q)
+            return self._swept_trajectory_is_collision_free(
+                self.trajectory_coefficients,
+                self.trajectory_duration,
+            )
+        finally:
+            (
+                self.trajectory_phase,
+                self.trajectory_start,
+                self.trajectory_goal,
+                self.trajectory_start_velocity,
+                self.trajectory_start_acceleration,
+                self.trajectory_velocity,
+                self.trajectory_acceleration,
+                self.trajectory_coefficients,
+                self.trajectory_elapsed,
+                self.trajectory_duration,
+            ) = snapshot
+
+    def _swept_trajectory_is_collision_free(
+        self,
+        coefficients: np.ndarray,
+        duration: float,
+    ) -> bool:
+        """Kinematically collision-check a trajectory at control-rate samples."""
+        sample_count = max(
+            33,
+            int(np.ceil(duration / self.control_dt)) + 1,
+        )
+        elapsed = np.linspace(0.0, duration, sample_count)
+        positions, _, _, _ = self._quintic_state(
+            coefficients, duration, elapsed
+        )
+        for body_id in self.bin_body_ids.values():
+            self.collision_model.body_pos[body_id] = self.model.body_pos[body_id]
+        self.collision_data.qpos[:] = self.data.qpos
+        self.collision_data.qvel[:] = 0.0
+        self.collision_data.ctrl[:] = self.data.ctrl
+        for qpos in positions:
+            self.collision_data.qpos[: self.arm_dofs] = qpos
+            # Only body kinematics and collision detection are needed here.
+            # Calling the full position pipeline would also solve tendon
+            # constraints for the frozen gripper.
+            mujoco.mj_kinematics(
+                self.collision_model, self.collision_data
+            )
+            mujoco.mj_collision(
+                self.collision_model, self.collision_data
+            )
+            if any(
+                self._scratch_contact_is_unsafe(
+                    int(contact.geom1),
+                    int(contact.geom2),
+                    None,
+                )
+                for contact in self.collision_data.contact[
+                    : self.collision_data.ncon
+                ]
+            ):
+                return False
+        return True
+
+    def _body_descends_from(self, body_id: int, root_id: int) -> bool:
+        while body_id > 0:
+            if body_id == root_id:
+                return True
+            body_id = int(self.model.body_parentid[body_id])
+        return False
+
+    def _scratch_contact_is_unsafe(
+        self,
+        geom1: int,
+        geom2: int,
+        expected_part_geom_id: int | None,
+    ) -> bool:
+        body1 = int(self.model.geom_bodyid[geom1])
+        body2 = int(self.model.geom_bodyid[geom2])
+        robot1 = self._body_descends_from(body1, self.robot_root_body_id)
+        robot2 = self._body_descends_from(body2, self.robot_root_body_id)
+        unsafe = robot1 != robot2
+
+        if robot1 != robot2 and expected_part_geom_id is not None:
+            robot_geom = geom1 if robot1 else geom2
+            external_geom = geom2 if robot1 else geom1
+            robot_body = int(self.model.geom_bodyid[robot_geom])
+            if (
+                self._body_descends_from(
+                    robot_body, self.gripper_root_body_id
+                )
+                and external_geom == expected_part_geom_id
+            ):
+                unsafe = False
+
+        if robot1 and robot2 and body1 != body2:
+            unsafe = int(self.model.body_parentid[body1]) != body2 and int(
+                self.model.body_parentid[body2]
+            ) != body1
+            if self._body_descends_from(
+                body1, self.gripper_root_body_id
+            ) and self._body_descends_from(
+                body2, self.gripper_root_body_id
+            ):
+                unsafe = False
+        return unsafe
 
     def _loaded_motion_scale(self, motion: str) -> float:
         """Choose audited loaded timing from crowding and held-part stability."""
@@ -822,6 +1241,14 @@ class FactoryFloorEnv:
 
         if len(self.active_part_order) == 1:
             if motion == "transfer":
+                part_name = self.holding_part or self.active_part
+                if part_name is not None:
+                    return float(
+                        self.part_specs[part_name].get(
+                            "single_transfer_scale",
+                            self.single_part_transfer_duration_scale,
+                        )
+                    )
                 return self.single_part_transfer_duration_scale
             return self.single_part_bin_hover_duration_scale
 
@@ -926,6 +1353,7 @@ class FactoryFloorEnv:
                     self.controller_phase = "return_home"
                 return
             self.active_part = next_part
+            self._reset_active_pick_direction()
             self.last_pick_hover_target = self._pick_hover_target(next_part)
             self.controller_phase = "move_to_pick_hover"
             return
@@ -1042,6 +1470,7 @@ class FactoryFloorEnv:
                         self.controller_phase = "return_home"
                     else:
                         self.active_part = next_part
+                        self._reset_active_pick_direction()
                         self.last_pick_hover_target = self._pick_hover_target(
                             next_part
                         )
@@ -1054,6 +1483,7 @@ class FactoryFloorEnv:
         if self.controller_phase == "return_home":
             if (
                 self.active_part is not None
+                and not self.force_full_home_for_pick
                 and self.trajectory_phase == "return_home"
                 and self.trajectory_elapsed
                 >= self.inter_pick_home_fraction * self.trajectory_duration
@@ -1072,6 +1502,9 @@ class FactoryFloorEnv:
                     if self._choose_next_part() is not None
                     else "idle"
                 )
+                if self.active_part is not None:
+                    self.force_full_home_for_pick = False
+                    self.route_retry_from_home = True
             return
 
         if self.controller_phase == "grasp_failed":
@@ -1080,12 +1513,16 @@ class FactoryFloorEnv:
             self.last_pick_hover_target = self.home_ee_target.copy()
             self.controller_phase = "return_home"
 
+        if self.controller_phase == "route_failed":
+            return
+
     def _controller_target_position(self) -> np.ndarray:
         if self.controller_phase in {
             "idle",
             "return_home",
             "drop_failed",
             "grasp_failed",
+            "route_failed",
         }:
             return self.home_ee_target
 
@@ -1133,7 +1570,12 @@ class FactoryFloorEnv:
             self.ik_data.qpos[:] = self.data.qpos
             self.ik_data.qvel[:] = 0.0
             self.ik_data.qpos[: self.arm_dofs] = q
-            mujoco.mj_forward(self.model, self.ik_data)
+            # IK only needs body/site transforms and subtree centers of mass
+            # for the geometric Jacobian. Running the complete position
+            # pipeline here would also solve contacts for every intermediate
+            # iterate, including deliberately bad candidate poses.
+            mujoco.mj_kinematics(self.model, self.ik_data)
+            mujoco.mj_comPos(self.model, self.ik_data)
 
             ee_pos = self.ik_data.site_xpos[self.ee_site_id].copy()
             current_quat = np.empty(4, dtype=float)
@@ -1176,7 +1618,7 @@ class FactoryFloorEnv:
             "settle_drop",
         }:
             return self.gripper_bin_direction
-        return self.gripper_pick_direction
+        return self.active_pick_direction
 
     def _gripper_target_rotation(self) -> np.ndarray:
         z_axis = self._gripper_target_direction()
@@ -1493,6 +1935,9 @@ class FactoryFloorEnv:
             "ee_position": self.data.site_xpos[self.ee_site_id].copy(),
             "holding_part": self.holding_part,
             "released_part": self.released_part,
+            "pick_direction_index": self.active_pick_direction_index,
+            "route_preflight_checks": self.route_preflight_checks,
+            "route_preflight_rejections": self.route_preflight_rejections,
             "sorted_counts": self._sorted_counts(),
             "parts": {
                 name: self._part_state(name)

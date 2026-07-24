@@ -54,6 +54,8 @@ def main() -> None:
                     and len(env.completed_parts) == len(env.active_part_order)
                 ):
                     break
+                if env.controller_phase in {"drop_failed", "route_failed"}:
+                    break
                 if env.controller_phase == "idle" and replans < 3:
                     replan_rgb = env.render_rgb()
                     try:

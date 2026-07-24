@@ -47,7 +47,11 @@ def test_physical_gripper_sorts_rounded_part_without_unsafe_contact() -> None:
         for _ in range(1_500):
             env.scripted_step()
             unsafe_contacts.update(_unsafe_contact_pairs(env))
-            if env.controller_phase in {"idle", "drop_failed"}:
+            if env.controller_phase in {
+                "idle",
+                "drop_failed",
+                "route_failed",
+            }:
                 break
 
         assert env.controller_phase == "idle"

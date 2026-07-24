@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from audit_motion import _unsafe_contact_pairs
 from env import FactoryFloorEnv
 
 
@@ -78,12 +79,117 @@ def test_next_pick_branches_before_exact_home_only_after_safe_fraction() -> None
         env.trajectory_phase = "return_home"
         env.trajectory_duration = 2.0
 
-        env.trajectory_elapsed = 1.79
+        env.trajectory_elapsed = 1.59
         env._advance_controller_state()
         assert env.controller_phase == "return_home"
 
-        env.trajectory_elapsed = 1.8
+        env.trajectory_elapsed = 1.6
         env._advance_controller_state()
         assert env.controller_phase == "move_to_pick_hover"
+    finally:
+        env.close()
+
+
+def test_mid_trajectory_replan_preserves_derivative_state_and_limits() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    try:
+        first_goal = np.clip(
+            env.home_ctrl + np.array([0.5, -0.2, 0.3, 0.2, -0.3, 0.25]),
+            env.ctrl_low,
+            env.ctrl_high,
+        )
+        env.controller_phase = "synthetic_first_segment"
+        for _ in range(20):
+            command = env._trajectory_command(first_goal)
+            env.data.ctrl[: env.arm_dofs] = command
+
+        branch_position = command.copy()
+        branch_velocity = env.trajectory_velocity.copy()
+        branch_acceleration = env.trajectory_acceleration.copy()
+        assert np.max(np.abs(branch_velocity)) > 0.05
+
+        second_goal = np.clip(
+            env.home_ctrl + np.array([-0.3, 0.25, -0.2, 0.1, 0.2, -0.15]),
+            env.ctrl_low,
+            env.ctrl_high,
+        )
+        env.controller_phase = "synthetic_second_segment"
+        env._trajectory_command(second_goal)
+
+        start_state = env._quintic_state(
+            env.trajectory_coefficients,
+            env.trajectory_duration,
+            0.0,
+        )
+        np.testing.assert_allclose(start_state[0], branch_position, atol=1e-12)
+        np.testing.assert_allclose(start_state[1], branch_velocity, atol=1e-12)
+        np.testing.assert_allclose(
+            start_state[2], branch_acceleration, atol=1e-12
+        )
+
+        elapsed = np.linspace(0.0, env.trajectory_duration, 1001)
+        _, velocity, acceleration, jerk = env._quintic_state(
+            env.trajectory_coefficients,
+            env.trajectory_duration,
+            elapsed,
+        )
+        assert np.all(
+            np.max(np.abs(velocity), axis=0)
+            <= env.max_joint_velocity + 1e-9
+        )
+        assert np.all(
+            np.max(np.abs(acceleration), axis=0)
+            <= env.max_joint_acceleration + 1e-9
+        )
+        assert np.all(
+            np.max(np.abs(jerk), axis=0)
+            <= env.trajectory_jerk_margin * env.max_joint_jerk + 1e-9
+        )
+        np.testing.assert_allclose(
+            env._quintic_state(
+                env.trajectory_coefficients,
+                env.trajectory_duration,
+                env.trajectory_duration,
+            )[0],
+            second_goal,
+            atol=1e-10,
+        )
+    finally:
+        env.close()
+
+
+def test_route_preview_has_clearance_without_changing_live_contacts() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    try:
+        table_geom_id = env.model.geom("table_top").id
+        assert env.model.geom_margin[table_geom_id] == 0.0
+        assert (
+            env.collision_model.geom_margin[table_geom_id]
+            == env.route_collision_margin
+        )
+        for name in env.active_part_order:
+            geom_id = env.part_geom_ids[name]
+            assert env.model.geom_contype[geom_id] != 0
+        for geom_id in env.part_geom_ids.values():
+            assert env.collision_model.geom_contype[geom_id] == 0
+    finally:
+        env.close()
+
+
+def test_swept_route_avoids_randomized_bin_graze_regression() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    env.random_state = np.random.default_rng(2)
+    env.reset()
+    unsafe_contacts: set[str] = set()
+    try:
+        # The old fixed pick attitude touched the randomized orange bin near
+        # t=21.3 s in this rollout.
+        for _ in range(1_300):
+            env.scripted_step()
+            unsafe_contacts.update(_unsafe_contact_pairs(env))
+
+        assert env.route_preflight_rejections > 0
+        assert env.controller_phase != "route_failed"
+        assert unsafe_contacts == set()
     finally:
         env.close()

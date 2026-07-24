@@ -77,6 +77,12 @@ def main() -> None:
                     log_path = write_safety_failure(failure)
                     print(safety_failure_message(failure, log_path))
                     break
+                if env.controller_phase == "route_failed":
+                    print(
+                        "Route planning stopped: no collision-free, reachable "
+                        "pick approach was found, including from exact home."
+                    )
+                    break
                 if sort_is_complete(env):
                     print(
                         sort_success_message(

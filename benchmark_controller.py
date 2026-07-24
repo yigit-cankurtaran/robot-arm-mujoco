@@ -60,7 +60,7 @@ def run_trial(kind: str, seed: int, part_count: int, max_steps: int) -> Benchmar
             if (
                 failure is not None
                 or sort_is_complete(env)
-                or env.controller_phase == "drop_failed"
+                or env.controller_phase in {"drop_failed", "route_failed"}
             ):
                 break
         return BenchmarkTrial(
@@ -73,7 +73,13 @@ def run_trial(kind: str, seed: int, part_count: int, max_steps: int) -> Benchmar
             wall_seconds=round(time.perf_counter() - started, 3),
             steps=step + 1,
             ik_calls=ik_calls,
-            failure=failure.contacts[0].pair if failure is not None else None,
+            failure=(
+                failure.contacts[0].pair
+                if failure is not None
+                else env.controller_phase
+                if env.controller_phase in {"drop_failed", "route_failed"}
+                else None
+            ),
         )
     finally:
         env.close()

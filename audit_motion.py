@@ -62,6 +62,8 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
         ):
             completed = True
             break
+        if env.controller_phase in {"drop_failed", "route_failed"}:
+            break
 
     command_array = np.asarray(commands)
     velocity = np.diff(command_array, axis=0) / env.control_dt
