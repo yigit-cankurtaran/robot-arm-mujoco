@@ -75,3 +75,73 @@ def test_expected_fingertip_part_contact_is_not_a_failure() -> None:
         assert detect_safety_failure(env, wall_seconds=1.1) is None
     finally:
         env.close()
+
+
+def test_gripper_table_top_contact_is_not_a_failure() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    try:
+        table_geom = env.model.geom("table_top").id
+        pad_geom = next(iter(env.gripper_pad_geom_ids["right"]))
+        env.contact_events_this_step = [
+            ContactEvent(
+                # Reverse ordering verifies that classification is symmetric.
+                geom1=table_geom,
+                geom2=pad_geom,
+                distance=-0.0008,
+                position=(0.4, -0.2, env.table_surface_z),
+                simulated_time=2.0,
+                controller_phase="close_gripper",
+                expected_part_geom_id=None,
+            )
+        ]
+        assert detect_safety_failure(env, wall_seconds=2.1) is None
+    finally:
+        env.close()
+
+
+def test_arm_table_top_contact_remains_a_failure() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    try:
+        table_geom = env.model.geom("table_top").id
+        arm_geom = first_geom_on_body(env, "upper_arm_link")
+        env.contact_events_this_step = [
+            ContactEvent(
+                geom1=arm_geom,
+                geom2=table_geom,
+                distance=-0.001,
+                position=(0.3, 0.0, env.table_surface_z),
+                simulated_time=3.0,
+                controller_phase="move_to_pick",
+                expected_part_geom_id=None,
+            )
+        ]
+        failure = detect_safety_failure(env, wall_seconds=3.1)
+        assert failure is not None
+        assert "upper_arm_link" in failure.contacts[0].pair
+        assert "table_top" in failure.contacts[0].pair
+    finally:
+        env.close()
+
+
+def test_gripper_bin_contact_remains_a_failure() -> None:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    try:
+        pad_geom = next(iter(env.gripper_pad_geom_ids["left"]))
+        bin_geom = env.bin_geom_ids["bin_1"][0]
+        env.contact_events_this_step = [
+            ContactEvent(
+                geom1=pad_geom,
+                geom2=bin_geom,
+                distance=-0.001,
+                position=(0.62, 0.08, 0.62),
+                simulated_time=4.0,
+                controller_phase="move_to_drop",
+                expected_part_geom_id=None,
+            )
+        ]
+        failure = detect_safety_failure(env, wall_seconds=4.1)
+        assert failure is not None
+        assert "gripper/" in failure.contacts[0].pair
+        assert "orange_bin" in failure.contacts[0].pair
+    finally:
+        env.close()

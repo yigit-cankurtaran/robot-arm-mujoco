@@ -74,12 +74,24 @@ def _event_is_unsafe(env: FactoryFloorEnv, event: ContactEvent) -> bool:
     robot2 = _body_descends_from(model, body2, robot_root)
     unsafe = robot1 != robot2
 
-    if robot1 != robot2 and event.expected_part_geom_id is not None:
+    if robot1 != robot2:
         robot_geom = event.geom1 if robot1 else event.geom2
         external_geom = event.geom2 if robot1 else event.geom1
         robot_body = int(model.geom_bodyid[robot_geom])
-        if (
-            _body_descends_from(model, robot_body, gripper_root)
+        robot_is_gripper = _body_descends_from(
+            model, robot_body, gripper_root
+        )
+        table_top_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "table_top"
+        )
+        if robot_is_gripper and external_geom == table_top_geom:
+            # A low grasp may brush the tabletop with the physical gripper.
+            # This is tolerated, while arm/table and all robot/bin contacts
+            # remain safety failures.
+            unsafe = False
+        elif (
+            event.expected_part_geom_id is not None
+            and robot_is_gripper
             and external_geom == event.expected_part_geom_id
         ):
             unsafe = False
