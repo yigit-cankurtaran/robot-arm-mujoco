@@ -16,6 +16,8 @@ SINGLE_CASES = (1, 4, 7, 11, 12, 21, 23)
 MIXED_CASES = (0, 1, 2, 4)
 BASELINE_SINGLE_MEAN_SECONDS = 20.32
 BASELINE_MIXED_MEAN_SECONDS = 63.205
+MAX_ACCEPTED_SINGLE_MEAN_SECONDS = 15.0
+MAX_ACCEPTED_MIXED_MEAN_SECONDS = 56.5
 
 
 @dataclass
@@ -120,12 +122,26 @@ def main() -> None:
 
     single_mean = mean_seconds("single")
     mixed_mean = mean_seconds("mixed")
+    speed_gate_passed = bool(
+        args.quick
+        or (
+            single_mean is not None
+            and mixed_mean is not None
+            and single_mean <= MAX_ACCEPTED_SINGLE_MEAN_SECONDS
+            and mixed_mean <= MAX_ACCEPTED_MIXED_MEAN_SECONDS
+        )
+    )
     summary = {
-        "passed": len(accepted) == len(trials),
+        "passed": len(accepted) == len(trials) and speed_gate_passed,
         "accepted_trials": len(accepted),
         "trials": len(trials),
         "single_mean_simulated_seconds": single_mean,
         "mixed_mean_simulated_seconds": mixed_mean,
+        "speed_gate_passed": speed_gate_passed,
+        "maximum_accepted_mean_seconds": {
+            "single": MAX_ACCEPTED_SINGLE_MEAN_SECONDS,
+            "mixed": MAX_ACCEPTED_MIXED_MEAN_SECONDS,
+        },
         "single_speedup_percent": (
             round(
                 100.0

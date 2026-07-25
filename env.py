@@ -155,14 +155,17 @@ class FactoryFloorEnv:
         # motion. These scales are benchmarked independently so speed tuning
         # never has to weaken the underlying velocity/acceleration/jerk limits.
         self.transfer_duration_scale = 2.35
-        self.bin_hover_duration_scale = 3.0
+        self.bin_hover_duration_scale = 1.7
         # Flat-sided and upright, axisymmetric parts remain well constrained
-        # between the pads and can tolerate a modestly quicker loaded motion.
-        # Rounded/low-profile parts keep the conservative default above.
+        # during the long transfer. Their final bin approach retains more
+        # tracking margin because its tested joint path passes closer to the
+        # table than the compact rounded/low-profile group.
         self.stable_part_transfer_duration_scale = 2.2
-        self.stable_part_bin_hover_duration_scale = 2.7
-        self.single_part_transfer_duration_scale = 2.0
-        self.single_part_bin_hover_duration_scale = 2.4
+        self.stable_part_bin_hover_duration_scale = 2.4
+        # With no neighboring or previously sorted objects, a single-object
+        # episode can run much nearer the derivative-limited trajectory.
+        self.single_part_transfer_duration_scale = 1.3
+        self.single_part_bin_hover_duration_scale = 1.0
 
         self.ik_iterations = 32
         self.ik_damping = 0.08
