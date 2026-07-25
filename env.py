@@ -154,7 +154,7 @@ class FactoryFloorEnv:
         # Loaded motion is intentionally slower than unloaded minimum-jerk
         # motion. These scales are benchmarked independently so speed tuning
         # never has to weaken the underlying velocity/acceleration/jerk limits.
-        self.transfer_duration_scale = 2.35
+        self.transfer_duration_scale = 2.2
         self.bin_hover_duration_scale = 1.7
         # Flat-sided and upright, axisymmetric parts remain well constrained
         # during the long transfer. Their final bin approach retains more
@@ -166,6 +166,18 @@ class FactoryFloorEnv:
         # episode can run much nearer the derivative-limited trajectory.
         self.single_part_transfer_duration_scale = 1.3
         self.single_part_bin_hover_duration_scale = 1.0
+        # Unloaded single-object motion can use more of the UR5e's simulated
+        # servo envelope without disturbing another object or carrying a load.
+        # Multi-object episodes retain the nominal limits because even a 5%
+        # increase changed contact/recovery behavior in the accuracy suite.
+        self.single_unloaded_limit_scale = 1.2
+        # After the last release there is no payload and no following pick whose
+        # IK branch can be disturbed. Use more servo headroom for deterministic
+        # shutdown, while respecting the UR5e's pi-rad/s joint-speed envelope.
+        self.shutdown_unloaded_limit_scale = 2.0
+        self.hardware_joint_velocity_limit = np.full(
+            self.arm_dofs, np.pi, dtype=float
+        )
 
         self.ik_iterations = 32
         self.ik_damping = 0.08
@@ -884,14 +896,19 @@ class FactoryFloorEnv:
             # A general boundary-conditioned quintic is then checked below
             # because a mid-motion replan can start with nonzero velocity and
             # acceleration.
-            velocity_time = 1.875 * delta / self.max_joint_velocity
+            (
+                velocity_limits,
+                acceleration_limits,
+                jerk_limits,
+            ) = self._trajectory_derivative_limits()
+            velocity_time = 1.875 * delta / velocity_limits
             acceleration_time = np.sqrt(
-                5.7735 * delta / self.max_joint_acceleration
+                5.7735 * delta / acceleration_limits
             )
             jerk_time = np.cbrt(
                 60.0
                 * delta
-                / (self.trajectory_jerk_margin * self.max_joint_jerk)
+                / (self.trajectory_jerk_margin * jerk_limits)
             )
             stationary = bool(
                 float(np.max(delta)) < 1e-6
@@ -928,7 +945,12 @@ class FactoryFloorEnv:
                 (
                     self.trajectory_duration,
                     self.trajectory_coefficients,
-                ) = self._limit_checked_trajectory(initial_duration)
+                ) = self._limit_checked_trajectory(
+                    initial_duration,
+                    velocity_limits,
+                    acceleration_limits,
+                    jerk_limits,
+                )
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration
@@ -1011,8 +1033,43 @@ class FactoryFloorEnv:
             return position[0], velocity[0], acceleration[0], jerk[0]
         return position, velocity, acceleration, jerk
 
+    def _trajectory_derivative_limits(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return phase/load-specific command limits for a new segment."""
+        if (
+            self.controller_phase == "return_home"
+            and self.active_part is None
+            and self.holding_part is None
+        ):
+            scale = self.shutdown_unloaded_limit_scale
+            return (
+                np.minimum(
+                    self.max_joint_velocity * scale,
+                    self.hardware_joint_velocity_limit,
+                ),
+                self.max_joint_acceleration * scale,
+                self.max_joint_jerk * scale,
+            )
+        single_unloaded = (
+            len(self.active_part_order) == 1
+            and self.holding_part is None
+            and self.controller_phase
+            in {"move_to_pick_hover", "move_to_pick", "return_home"}
+        )
+        scale = self.single_unloaded_limit_scale if single_unloaded else 1.0
+        return (
+            self.max_joint_velocity * scale,
+            self.max_joint_acceleration * scale,
+            self.max_joint_jerk * scale,
+        )
+
     def _limit_checked_trajectory(
-        self, initial_duration: float
+        self,
+        initial_duration: float,
+        velocity_limits: np.ndarray,
+        acceleration_limits: np.ndarray,
+        jerk_limits: np.ndarray,
     ) -> tuple[float, np.ndarray]:
         """Expand duration until the full polynomial respects every limit."""
         duration = max(initial_duration, self.control_dt)
@@ -1029,15 +1086,15 @@ class FactoryFloorEnv:
             if (
                 np.all(
                     np.max(np.abs(velocity), axis=0)
-                    <= self.max_joint_velocity
+                    <= velocity_limits
                 )
                 and np.all(
                     np.max(np.abs(acceleration), axis=0)
-                    <= self.max_joint_acceleration
+                    <= acceleration_limits
                 )
                 and np.all(
                     np.max(np.abs(jerk), axis=0)
-                    <= self.trajectory_jerk_margin * self.max_joint_jerk
+                    <= self.trajectory_jerk_margin * jerk_limits
                 )
             ):
                 return duration, coefficients

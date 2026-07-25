@@ -47,6 +47,59 @@ def test_low_crowding_uses_faster_loaded_motion_scales() -> None:
         env.close()
 
 
+def test_single_unloaded_motion_uses_higher_bounded_derivative_limits() -> None:
+    env = FactoryFloorEnv(
+        enable_rgb_observation=False,
+        min_active_parts=1,
+        max_active_parts=1,
+    )
+    try:
+        env.controller_phase = "move_to_pick_hover"
+        env.holding_part = None
+        velocity, acceleration, jerk = env._trajectory_derivative_limits()
+        np.testing.assert_allclose(
+            velocity,
+            env.single_unloaded_limit_scale * env.max_joint_velocity,
+        )
+        np.testing.assert_allclose(
+            acceleration,
+            env.single_unloaded_limit_scale * env.max_joint_acceleration,
+        )
+        np.testing.assert_allclose(
+            jerk,
+            env.single_unloaded_limit_scale * env.max_joint_jerk,
+        )
+
+        env.holding_part = env.active_part_order[0]
+        velocity, acceleration, jerk = env._trajectory_derivative_limits()
+        np.testing.assert_allclose(velocity, env.max_joint_velocity)
+        np.testing.assert_allclose(acceleration, env.max_joint_acceleration)
+        np.testing.assert_allclose(jerk, env.max_joint_jerk)
+
+        env.holding_part = None
+        env.active_part = None
+        env.controller_phase = "return_home"
+        velocity, acceleration, jerk = env._trajectory_derivative_limits()
+        np.testing.assert_allclose(
+            velocity,
+            np.minimum(
+                env.shutdown_unloaded_limit_scale * env.max_joint_velocity,
+                env.hardware_joint_velocity_limit,
+            ),
+        )
+        np.testing.assert_allclose(
+            acceleration,
+            env.shutdown_unloaded_limit_scale
+            * env.max_joint_acceleration,
+        )
+        np.testing.assert_allclose(
+            jerk,
+            env.shutdown_unloaded_limit_scale * env.max_joint_jerk,
+        )
+    finally:
+        env.close()
+
+
 def test_loaded_motion_scale_adapts_to_shape_stability() -> None:
     env = FactoryFloorEnv(enable_rgb_observation=False)
     try:

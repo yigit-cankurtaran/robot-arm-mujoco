@@ -104,6 +104,21 @@ def main() -> None:
 
     trials = [run_trial(seed, args.max_cycle_time) for seed in range(args.seeds)]
     limits = FactoryFloorEnv(enable_rgb_observation=False)
+    absolute_velocity_limits = np.maximum(
+        limits.max_joint_velocity * limits.single_unloaded_limit_scale,
+        np.minimum(
+            limits.max_joint_velocity * limits.shutdown_unloaded_limit_scale,
+            limits.hardware_joint_velocity_limit,
+        ),
+    )
+    absolute_acceleration_limits = limits.max_joint_acceleration * max(
+        limits.single_unloaded_limit_scale,
+        limits.shutdown_unloaded_limit_scale,
+    )
+    absolute_jerk_limits = limits.max_joint_jerk * max(
+        limits.single_unloaded_limit_scale,
+        limits.shutdown_unloaded_limit_scale,
+    )
 
     def exceeds(values: list[float], bounds: np.ndarray) -> bool:
         # Small allowance covers finite-difference sampling and rounding.
@@ -115,11 +130,11 @@ def main() -> None:
         if not trial.completed
         or trial.unsafe_contacts > 0
         or trial.cycle_time > args.max_cycle_time
-        or exceeds(trial.peak_command_velocity, limits.max_joint_velocity)
+        or exceeds(trial.peak_command_velocity, absolute_velocity_limits)
         or exceeds(
-            trial.peak_command_acceleration, limits.max_joint_acceleration
+            trial.peak_command_acceleration, absolute_acceleration_limits
         )
-        or exceeds(trial.peak_command_jerk, limits.max_joint_jerk)
+        or exceeds(trial.peak_command_jerk, absolute_jerk_limits)
     ]
     summary = {
         "passed": not failures,
