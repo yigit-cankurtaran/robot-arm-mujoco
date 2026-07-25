@@ -61,6 +61,18 @@ class ContactEvent:
     expected_part_geom_id: int | None
 
 
+@dataclass(frozen=True)
+class LoadedRoutePlan:
+    """One collision-checked loaded route from pick hover to bin hover."""
+
+    transfer_goal: np.ndarray
+    bin_hover_goal: np.ndarray
+    direct_to_bin: bool
+    kind: str
+    predicted_duration: float
+    baseline_duration: float
+
+
 class FactoryFloorEnv:
     def __init__(
         self,
@@ -216,6 +228,11 @@ class FactoryFloorEnv:
         self.grasp_table_clearance = 0.006
         self.max_grasp_center_offset = 0.018
         self.transfer_target = np.array([0.45, 0.0, 0.82], dtype=float)
+        # The loaded planner may replace the fixed transfer waypoint with a
+        # shorter collision-checked joint-space route. A small improvement
+        # threshold avoids changing a proven physical route for timing noise.
+        self.loaded_route_minimum_savings = 0.10
+        self.loaded_route_shortcut_fractions = (0.25, 0.50, 0.75)
         self.bin_ik_seed = np.array(
             [-0.0324, -1.3677, -1.0930, -1.1547, 2.1906, -3.4311],
             dtype=float,
@@ -449,7 +466,7 @@ class FactoryFloorEnv:
         self.gripper_root_body_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper/base_mount"
         )
-        clearance_geoms = [
+        self.route_clearance_geom_ids = [
             mujoco.mj_name2id(
                 self.collision_model,
                 mujoco.mjtObj.mjOBJ_GEOM,
@@ -461,7 +478,7 @@ class FactoryFloorEnv:
                 for geom_id in geom_ids
             ),
         ]
-        for geom_id in clearance_geoms:
+        for geom_id in self.route_clearance_geom_ids:
             self.collision_model.geom_margin[geom_id] = max(
                 self.collision_model.geom_margin[geom_id],
                 self.route_collision_margin,
@@ -491,6 +508,13 @@ class FactoryFloorEnv:
         self.route_retry_from_home = False
         self.route_preflight_checks = 0
         self.route_preflight_rejections = 0
+        self.loaded_route_plan: LoadedRoutePlan | None = None
+        self.loaded_route_plans = 0
+        self.loaded_route_direct_shortcuts = 0
+        self.loaded_route_blended_shortcuts = 0
+        self.loaded_route_baseline_fallbacks = 0
+        self.loaded_route_preflight_rejections = 0
+        self.loaded_route_predicted_seconds_saved = 0.0
         self.spawn_layout: dict[str, np.ndarray] = {}
 
         self.trajectory_phase: str | None = None
@@ -718,6 +742,13 @@ class FactoryFloorEnv:
         self.route_retry_from_home = False
         self.route_preflight_checks = 0
         self.route_preflight_rejections = 0
+        self.loaded_route_plan = None
+        self.loaded_route_plans = 0
+        self.loaded_route_direct_shortcuts = 0
+        self.loaded_route_blended_shortcuts = 0
+        self.loaded_route_baseline_fallbacks = 0
+        self.loaded_route_preflight_rejections = 0
+        self.loaded_route_predicted_seconds_saved = 0.0
         self._reset_joint_trajectory()
         self.rgb_frame_counter = 0
         self.last_rgb = None
@@ -839,14 +870,33 @@ class FactoryFloorEnv:
             # if it drifted materially.
             target_q = self.trajectory_goal.copy()
         else:
-            target_q = (
-                self._select_collision_free_pick_target(target_pos)
-                if self.controller_phase
-                in {"move_to_pick_hover", "move_to_pick"}
-                else self._solve_inverse_kinematics(target_pos)
-            )
+            if self.controller_phase == "move_to_transfer":
+                loaded_plan = self.loaded_route_plan or self._plan_loaded_route()
+                target_q = (
+                    loaded_plan.transfer_goal.copy()
+                    if loaded_plan is not None
+                    else None
+                )
+            elif (
+                self.controller_phase == "move_to_bin_hover"
+                and self.loaded_route_plan is not None
+            ):
+                target_q = self.loaded_route_plan.bin_hover_goal.copy()
+            else:
+                target_q = (
+                    self._select_collision_free_pick_target(target_pos)
+                    if self.controller_phase
+                    in {"move_to_pick_hover", "move_to_pick"}
+                    else self._solve_inverse_kinematics(target_pos)
+                )
             if target_q is None:
-                self._handle_blocked_pick_route()
+                if self.controller_phase in {
+                    "move_to_pick_hover",
+                    "move_to_pick",
+                }:
+                    self._handle_blocked_pick_route()
+                else:
+                    self.controller_phase = "route_failed"
                 target_q = self.home_ctrl.copy()
         smooth_target_q = self._trajectory_command(target_q)
         self.set_arm_configuration(smooth_target_q)
@@ -890,67 +940,16 @@ class FactoryFloorEnv:
                 self.trajectory_acceleration.copy()
             )
             self.trajectory_elapsed = 0.0
-            delta = np.abs(self.trajectory_goal - self.trajectory_start)
-
-            # These rest-to-rest extrema provide a good initial duration.
-            # A general boundary-conditioned quintic is then checked below
-            # because a mid-motion replan can start with nonzero velocity and
-            # acceleration.
             (
-                velocity_limits,
-                acceleration_limits,
-                jerk_limits,
-            ) = self._trajectory_derivative_limits()
-            velocity_time = 1.875 * delta / velocity_limits
-            acceleration_time = np.sqrt(
-                5.7735 * delta / acceleration_limits
+                self.trajectory_duration,
+                self.trajectory_coefficients,
+            ) = self._plan_joint_segment(
+                self.trajectory_start,
+                self.trajectory_goal,
+                self.trajectory_start_velocity,
+                self.trajectory_start_acceleration,
+                self.controller_phase,
             )
-            jerk_time = np.cbrt(
-                60.0
-                * delta
-                / (self.trajectory_jerk_margin * jerk_limits)
-            )
-            stationary = bool(
-                float(np.max(delta)) < 1e-6
-                and float(np.max(np.abs(self.trajectory_start_velocity)))
-                < 1e-6
-                and float(
-                    np.max(np.abs(self.trajectory_start_acceleration))
-                )
-                < 1e-6
-            )
-            if stationary:
-                self.trajectory_duration = self.control_dt
-                self.trajectory_coefficients = (
-                    self._quintic_coefficients(self.trajectory_duration)
-                )
-            else:
-                initial_duration = max(
-                    self.min_trajectory_duration,
-                    float(np.max(velocity_time)),
-                    float(np.max(acceleration_time)),
-                    float(np.max(jerk_time)),
-                )
-                if self.controller_phase == "move_to_bin_hover":
-                    initial_duration *= self._loaded_motion_scale(
-                        "bin_hover"
-                    )
-                elif self.controller_phase == "move_to_transfer":
-                    # This phase also rotates from the pick attitude to the bin
-                    # attitude. Slow it under load so rounded parts do not gain
-                    # enough lateral momentum to slide out of the real pads.
-                    initial_duration *= self._loaded_motion_scale(
-                        "transfer"
-                    )
-                (
-                    self.trajectory_duration,
-                    self.trajectory_coefficients,
-                ) = self._limit_checked_trajectory(
-                    initial_duration,
-                    velocity_limits,
-                    acceleration_limits,
-                    jerk_limits,
-                )
 
         self.trajectory_elapsed = min(
             self.trajectory_elapsed + self.control_dt, self.trajectory_duration
@@ -967,17 +966,94 @@ class FactoryFloorEnv:
         )
         return command
 
+    def _plan_joint_segment(
+        self,
+        start: np.ndarray,
+        goal: np.ndarray,
+        start_velocity: np.ndarray,
+        start_acceleration: np.ndarray,
+        phase: str,
+    ) -> tuple[float, np.ndarray]:
+        """Time-parameterize a joint segment without mutating controller state."""
+        start = np.asarray(start, dtype=float)
+        goal = np.clip(np.asarray(goal, dtype=float), self.ctrl_low, self.ctrl_high)
+        start_velocity = np.asarray(start_velocity, dtype=float)
+        start_acceleration = np.asarray(start_acceleration, dtype=float)
+        delta = np.abs(goal - start)
+
+        # Rest-to-rest extrema seed the duration. The sampled general quintic
+        # check below also covers a mid-motion replan with nonzero derivatives.
+        velocity_limits, acceleration_limits, jerk_limits = (
+            self._trajectory_derivative_limits(phase)
+        )
+        velocity_time = 1.875 * delta / velocity_limits
+        acceleration_time = np.sqrt(5.7735 * delta / acceleration_limits)
+        jerk_time = np.cbrt(
+            60.0 * delta / (self.trajectory_jerk_margin * jerk_limits)
+        )
+        stationary = bool(
+            float(np.max(delta)) < 1e-6
+            and float(np.max(np.abs(start_velocity))) < 1e-6
+            and float(np.max(np.abs(start_acceleration))) < 1e-6
+        )
+        if stationary:
+            duration = self.control_dt
+            return duration, self._quintic_coefficients_for_boundaries(
+                duration,
+                start,
+                goal,
+                start_velocity,
+                start_acceleration,
+            )
+
+        initial_duration = max(
+            self.min_trajectory_duration,
+            float(np.max(velocity_time)),
+            float(np.max(acceleration_time)),
+            float(np.max(jerk_time)),
+        )
+        if phase == "move_to_bin_hover":
+            initial_duration *= self._loaded_motion_scale("bin_hover")
+        elif phase == "move_to_transfer":
+            # Loaded transfer also rotates the tool from its pick attitude.
+            initial_duration *= self._loaded_motion_scale("transfer")
+        return self._limit_checked_trajectory(
+            initial_duration,
+            velocity_limits,
+            acceleration_limits,
+            jerk_limits,
+            start=start,
+            goal=goal,
+            start_velocity=start_velocity,
+            start_acceleration=start_acceleration,
+        )
+
     def _quintic_coefficients(self, duration: float) -> np.ndarray:
         """Build normalized-time coefficients for the current boundaries."""
+        return self._quintic_coefficients_for_boundaries(
+            duration,
+            self.trajectory_start,
+            self.trajectory_goal,
+            self.trajectory_start_velocity,
+            self.trajectory_start_acceleration,
+        )
+
+    def _quintic_coefficients_for_boundaries(
+        self,
+        duration: float,
+        start: np.ndarray,
+        goal: np.ndarray,
+        start_velocity: np.ndarray,
+        start_acceleration: np.ndarray,
+    ) -> np.ndarray:
+        """Build normalized quintic coefficients for explicit boundaries."""
         coefficients = np.zeros((6, self.arm_dofs), dtype=float)
-        coefficients[0] = self.trajectory_start
-        coefficients[1] = self.trajectory_start_velocity * duration
+        coefficients[0] = start
+        coefficients[1] = start_velocity * duration
         coefficients[2] = (
-            0.5 * self.trajectory_start_acceleration * duration**2
+            0.5 * start_acceleration * duration**2
         )
-        remaining_position = self.trajectory_goal - np.sum(
-            coefficients[:3], axis=0
-        )
+        remaining_position = goal - np.sum(coefficients[:3], axis=0)
         remaining_velocity = -coefficients[1] - 2.0 * coefficients[2]
         remaining_acceleration = -2.0 * coefficients[2]
         boundary_matrix = np.array(
@@ -1035,10 +1111,12 @@ class FactoryFloorEnv:
 
     def _trajectory_derivative_limits(
         self,
+        phase: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return phase/load-specific command limits for a new segment."""
+        phase = self.controller_phase if phase is None else phase
         if (
-            self.controller_phase == "return_home"
+            phase == "return_home"
             and self.active_part is None
             and self.holding_part is None
         ):
@@ -1054,8 +1132,7 @@ class FactoryFloorEnv:
         single_unloaded = (
             len(self.active_part_order) == 1
             and self.holding_part is None
-            and self.controller_phase
-            in {"move_to_pick_hover", "move_to_pick", "return_home"}
+            and phase in {"move_to_pick_hover", "move_to_pick", "return_home"}
         )
         scale = self.single_unloaded_limit_scale if single_unloaded else 1.0
         return (
@@ -1070,11 +1147,30 @@ class FactoryFloorEnv:
         velocity_limits: np.ndarray,
         acceleration_limits: np.ndarray,
         jerk_limits: np.ndarray,
+        *,
+        start: np.ndarray | None = None,
+        goal: np.ndarray | None = None,
+        start_velocity: np.ndarray | None = None,
+        start_acceleration: np.ndarray | None = None,
     ) -> tuple[float, np.ndarray]:
         """Expand duration until the full polynomial respects every limit."""
+        if start is None:
+            start = self.trajectory_start
+        if goal is None:
+            goal = self.trajectory_goal
+        if start_velocity is None:
+            start_velocity = self.trajectory_start_velocity
+        if start_acceleration is None:
+            start_acceleration = self.trajectory_start_acceleration
         duration = max(initial_duration, self.control_dt)
         for _ in range(40):
-            coefficients = self._quintic_coefficients(duration)
+            coefficients = self._quintic_coefficients_for_boundaries(
+                duration,
+                start,
+                goal,
+                start_velocity,
+                start_acceleration,
+            )
             sample_count = max(
                 257,
                 int(np.ceil(duration / self.control_dt)) * 4 + 1,
@@ -1106,6 +1202,7 @@ class FactoryFloorEnv:
         self.active_pick_direction_index = 0
         self.force_full_home_for_pick = False
         self.route_retry_from_home = False
+        self.loaded_route_plan = None
 
     def _select_collision_free_pick_target(
         self, target_pos: np.ndarray
@@ -1207,6 +1304,159 @@ class FactoryFloorEnv:
                 self.trajectory_elapsed,
                 self.trajectory_duration,
             ) = snapshot
+
+    def _preview_joint_segment(
+        self,
+        start: np.ndarray,
+        goal: np.ndarray,
+        phase: str,
+    ) -> tuple[bool, float]:
+        """Return collision status and duration for a rest-to-rest segment."""
+        duration, coefficients = self._plan_joint_segment(
+            start,
+            goal,
+            np.zeros(self.arm_dofs, dtype=float),
+            np.zeros(self.arm_dofs, dtype=float),
+            phase,
+        )
+        return (
+            self._swept_trajectory_is_collision_free(coefficients, duration),
+            duration,
+        )
+
+    def _plan_loaded_route(self) -> LoadedRoutePlan | None:
+        """Choose the quickest safe joint route from pick hover to bin hover."""
+        part_name = self.holding_part
+        if part_name is None:
+            return None
+
+        start = self.data.ctrl[: self.arm_dofs].copy()
+        hover_target = self._part_bin_hover_target(part_name)
+        bin_hover_goal = self._solve_inverse_kinematics(
+            hover_target,
+            phase="move_to_bin_hover",
+        )
+        if not self._ik_solution_reaches_target(bin_hover_goal, hover_target):
+            return None
+
+        transfer_goal = self._solve_inverse_kinematics(
+            self.transfer_target,
+            phase="move_to_transfer",
+        )
+        if not self._ik_solution_reaches_target(
+            transfer_goal, self.transfer_target
+        ):
+            return None
+
+        def evaluate(
+            waypoint: np.ndarray | None,
+        ) -> tuple[bool, float]:
+            if waypoint is None:
+                return self._preview_joint_segment(
+                    start,
+                    bin_hover_goal,
+                    "move_to_transfer",
+                )
+            first_safe, first_duration = self._preview_joint_segment(
+                start,
+                waypoint,
+                "move_to_transfer",
+            )
+            if not first_safe:
+                return False, first_duration
+            second_safe, second_duration = self._preview_joint_segment(
+                waypoint,
+                bin_hover_goal,
+                "move_to_bin_hover",
+            )
+            return first_safe and second_safe, first_duration + second_duration
+
+        baseline_safe, baseline_duration = evaluate(transfer_goal)
+        candidates: list[tuple[str, np.ndarray | None, bool, float]] = []
+
+        direct_safe, direct_duration = evaluate(None)
+        candidates.append(("direct", None, direct_safe, direct_duration))
+
+        line_delta = bin_hover_goal - start
+        line_norm_squared = float(line_delta @ line_delta)
+        if line_norm_squared > 1e-9:
+            projection_fraction = float(
+                np.clip(
+                    ((transfer_goal - start) @ line_delta)
+                    / line_norm_squared,
+                    0.0,
+                    1.0,
+                )
+            )
+            projected_waypoint = start + projection_fraction * line_delta
+            for shortcut_fraction in self.loaded_route_shortcut_fractions:
+                waypoint = (
+                    (1.0 - shortcut_fraction) * transfer_goal
+                    + shortcut_fraction * projected_waypoint
+                )
+                safe, duration = evaluate(waypoint)
+                candidates.append(
+                    (
+                        f"blend_{shortcut_fraction:.2f}",
+                        waypoint,
+                        safe,
+                        duration,
+                    )
+                )
+
+        self.loaded_route_preflight_rejections += int(not baseline_safe) + sum(
+            not safe for _, _, safe, _ in candidates
+        )
+        safe_candidates = [
+            candidate for candidate in candidates if candidate[2]
+        ]
+        best = (
+            min(safe_candidates, key=lambda candidate: candidate[3])
+            if safe_candidates
+            else None
+        )
+        if not baseline_safe and best is None:
+            return None
+        use_shortcut = bool(
+            best is not None
+            and (
+                not baseline_safe
+                or baseline_duration - best[3]
+                >= self.loaded_route_minimum_savings
+            )
+        )
+        if use_shortcut:
+            kind, waypoint, _, predicted_duration = best
+            direct_to_bin = waypoint is None
+            selected_transfer_goal = (
+                bin_hover_goal if direct_to_bin else waypoint
+            )
+        else:
+            kind = "baseline"
+            direct_to_bin = False
+            selected_transfer_goal = transfer_goal
+            predicted_duration = baseline_duration
+
+        plan = LoadedRoutePlan(
+            transfer_goal=np.asarray(selected_transfer_goal).copy(),
+            bin_hover_goal=bin_hover_goal.copy(),
+            direct_to_bin=direct_to_bin,
+            kind=kind,
+            predicted_duration=float(predicted_duration),
+            baseline_duration=float(baseline_duration),
+        )
+        self.loaded_route_plan = plan
+        self.loaded_route_plans += 1
+        if kind == "direct":
+            self.loaded_route_direct_shortcuts += 1
+        elif kind.startswith("blend_"):
+            self.loaded_route_blended_shortcuts += 1
+        else:
+            self.loaded_route_baseline_fallbacks += 1
+        self.loaded_route_predicted_seconds_saved += max(
+            0.0, baseline_duration - predicted_duration
+        )
+        return plan
 
     def _swept_trajectory_is_collision_free(
         self,
@@ -1468,8 +1718,37 @@ class FactoryFloorEnv:
             if self.holding_part is None:
                 self.controller_phase = "grasp_failed"
                 return
-            if self._trajectory_complete() and self._ee_close_to_position(
-                self.transfer_target, self._motion_position_tolerance()
+            loaded_plan = self.loaded_route_plan
+            if loaded_plan is None:
+                return
+            if loaded_plan.direct_to_bin:
+                if self._trajectory_complete() and self._ee_close_to_position(
+                    self._part_bin_hover_target(self.holding_part),
+                    self._motion_position_tolerance(),
+                ):
+                    self.controller_phase = "move_to_drop"
+                return
+            baseline_reached = (
+                loaded_plan.kind == "baseline"
+                and self._ee_close_to_position(
+                    self.transfer_target,
+                    self._motion_position_tolerance(),
+                )
+            )
+            shortcut_waypoint_reached = (
+                loaded_plan.kind.startswith("blend_")
+                and float(
+                    np.max(
+                        np.abs(
+                            self.data.qpos[: self.arm_dofs]
+                            - loaded_plan.transfer_goal
+                        )
+                    )
+                )
+                < 0.06
+            )
+            if self._trajectory_complete() and (
+                baseline_reached or shortcut_waypoint_reached
             ):
                 self.controller_phase = "move_to_bin_hover"
             return
@@ -1599,6 +1878,12 @@ class FactoryFloorEnv:
             return self.last_pick_hover_target
 
         if self.controller_phase == "move_to_transfer":
+            if (
+                self.loaded_route_plan is not None
+                and self.loaded_route_plan.direct_to_bin
+                and self.holding_part is not None
+            ):
+                return self._part_bin_hover_target(self.holding_part)
             return self.transfer_target
 
         part_name = self.holding_part or self.active_part
@@ -1615,12 +1900,17 @@ class FactoryFloorEnv:
             return self._part_bin_hover_target(part_name)
         return self.home_ee_target
 
-    def _solve_inverse_kinematics(self, target_pos: np.ndarray) -> np.ndarray:
+    def _solve_inverse_kinematics(
+        self,
+        target_pos: np.ndarray,
+        phase: str | None = None,
+    ) -> np.ndarray:
+        phase = self.controller_phase if phase is None else phase
         q = (
             self.bin_ik_seed.copy()
-            if self.controller_phase == "move_to_transfer"
+            if phase == "move_to_transfer"
             else self.bin_approach_ik_seed.copy()
-            if self.controller_phase in {"move_to_bin_hover", "move_to_drop"}
+            if phase in {"move_to_bin_hover", "move_to_drop"}
             else self.data.qpos[: self.arm_dofs].copy()
         )
         jacp = np.zeros((3, self.model.nv), dtype=float)
@@ -1644,7 +1934,7 @@ class FactoryFloorEnv:
             )
             target_quat = np.empty(4, dtype=float)
             mujoco.mju_mat2Quat(
-                target_quat, self._gripper_target_rotation().ravel()
+                target_quat, self._gripper_target_rotation(phase).ravel()
             )
             inverse_current = np.empty(4, dtype=float)
             mujoco.mju_negQuat(inverse_current, current_quat)
@@ -1669,8 +1959,11 @@ class FactoryFloorEnv:
 
         return q
 
-    def _gripper_target_direction(self) -> np.ndarray:
-        if self.controller_phase in {
+    def _gripper_target_direction(
+        self, phase: str | None = None
+    ) -> np.ndarray:
+        phase = self.controller_phase if phase is None else phase
+        if phase in {
             "move_to_transfer",
             "move_to_bin_hover",
             "move_to_drop",
@@ -1680,8 +1973,10 @@ class FactoryFloorEnv:
             return self.gripper_bin_direction
         return self.active_pick_direction
 
-    def _gripper_target_rotation(self) -> np.ndarray:
-        z_axis = self._gripper_target_direction()
+    def _gripper_target_rotation(
+        self, phase: str | None = None
+    ) -> np.ndarray:
+        z_axis = self._gripper_target_direction(phase)
         # Keep the jaw-closing axis horizontal so gravity cannot slide thin
         # pieces toward one fingertip during transport.
         y_axis = np.cross(np.array([0.0, 0.0, 1.0]), z_axis)
@@ -1998,6 +2293,27 @@ class FactoryFloorEnv:
             "pick_direction_index": self.active_pick_direction_index,
             "route_preflight_checks": self.route_preflight_checks,
             "route_preflight_rejections": self.route_preflight_rejections,
+            "loaded_route": (
+                self.loaded_route_plan.kind
+                if self.loaded_route_plan is not None
+                else None
+            ),
+            "loaded_route_plans": self.loaded_route_plans,
+            "loaded_route_direct_shortcuts": (
+                self.loaded_route_direct_shortcuts
+            ),
+            "loaded_route_blended_shortcuts": (
+                self.loaded_route_blended_shortcuts
+            ),
+            "loaded_route_baseline_fallbacks": (
+                self.loaded_route_baseline_fallbacks
+            ),
+            "loaded_route_preflight_rejections": (
+                self.loaded_route_preflight_rejections
+            ),
+            "loaded_route_predicted_seconds_saved": (
+                self.loaded_route_predicted_seconds_saved
+            ),
             "sorted_counts": self._sorted_counts(),
             "parts": {
                 name: self._part_state(name)

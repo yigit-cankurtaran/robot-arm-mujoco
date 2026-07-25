@@ -6,6 +6,16 @@ from audit_motion import _unsafe_contact_pairs
 from env import FactoryFloorEnv
 
 
+def _advance_until_loaded_plan(
+    env: FactoryFloorEnv, max_steps: int = 1_000
+) -> None:
+    for _ in range(max_steps):
+        env.scripted_step()
+        if env.loaded_route_plan is not None:
+            return
+    raise AssertionError("controller did not construct a loaded route")
+
+
 def test_active_trajectory_reuses_latched_ik_goal() -> None:
     env = FactoryFloorEnv(
         enable_rgb_observation=False,
@@ -17,10 +27,12 @@ def test_active_trajectory_reuses_latched_ik_goal() -> None:
     original_solver = env._solve_inverse_kinematics
     calls = 0
 
-    def counted_solver(target: np.ndarray) -> np.ndarray:
+    def counted_solver(
+        target: np.ndarray, phase: str | None = None
+    ) -> np.ndarray:
         nonlocal calls
         calls += 1
-        return original_solver(target)
+        return original_solver(target, phase)
 
     env._solve_inverse_kinematics = counted_solver
     try:
@@ -120,6 +132,51 @@ def test_loaded_motion_scale_adapts_to_shape_stability() -> None:
         assert env._loaded_motion_scale("bin_hover") == (
             env.bin_hover_duration_scale
         )
+    finally:
+        env.close()
+
+
+def test_loaded_planner_selects_a_faster_collision_checked_shortcut() -> None:
+    env = FactoryFloorEnv(
+        enable_rgb_observation=False,
+        min_active_parts=1,
+        max_active_parts=1,
+    )
+    env.random_state = np.random.default_rng(4)
+    env.reset()
+    try:
+        _advance_until_loaded_plan(env)
+        plan = env.loaded_route_plan
+        assert plan is not None
+        assert plan.kind == "direct"
+        assert plan.direct_to_bin
+        assert (
+            plan.baseline_duration - plan.predicted_duration
+            >= env.loaded_route_minimum_savings
+        )
+        assert env.loaded_route_direct_shortcuts == 1
+        assert env.loaded_route_baseline_fallbacks == 0
+    finally:
+        env.close()
+
+
+def test_loaded_planner_keeps_proven_route_when_shortcut_is_slower() -> None:
+    env = FactoryFloorEnv(
+        enable_rgb_observation=False,
+        min_active_parts=1,
+        max_active_parts=1,
+    )
+    env.random_state = np.random.default_rng(11)
+    env.reset()
+    try:
+        _advance_until_loaded_plan(env)
+        plan = env.loaded_route_plan
+        assert plan is not None
+        assert plan.kind == "baseline"
+        assert not plan.direct_to_bin
+        assert plan.predicted_duration == plan.baseline_duration
+        assert env.loaded_route_direct_shortcuts == 0
+        assert env.loaded_route_baseline_fallbacks == 1
     finally:
         env.close()
 

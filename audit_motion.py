@@ -23,6 +23,10 @@ class TrialMetrics:
     peak_command_jerk: list[float]
     peak_measured_velocity: list[float]
     peak_tracking_error: list[float]
+    loaded_route_direct_shortcuts: int
+    loaded_route_blended_shortcuts: int
+    loaded_route_baseline_fallbacks: int
+    loaded_route_predicted_seconds_saved: float
 
 
 def _unsafe_contact_pairs(env: FactoryFloorEnv) -> list[str]:
@@ -90,6 +94,12 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
         peak_tracking_error=_peak_abs(np.asarray(tracking_error), env.arm_dofs)
         .round(4)
         .tolist(),
+        loaded_route_direct_shortcuts=env.loaded_route_direct_shortcuts,
+        loaded_route_blended_shortcuts=env.loaded_route_blended_shortcuts,
+        loaded_route_baseline_fallbacks=env.loaded_route_baseline_fallbacks,
+        loaded_route_predicted_seconds_saved=round(
+            env.loaded_route_predicted_seconds_saved, 4
+        ),
     )
 
 
@@ -163,6 +173,24 @@ def main() -> None:
         "worst_peak_tracking_error": np.max(
             [trial.peak_tracking_error for trial in trials], axis=0
         ).round(4).tolist(),
+        "loaded_route_selection": {
+            "direct_shortcuts": sum(
+                trial.loaded_route_direct_shortcuts for trial in trials
+            ),
+            "blended_shortcuts": sum(
+                trial.loaded_route_blended_shortcuts for trial in trials
+            ),
+            "baseline_fallbacks": sum(
+                trial.loaded_route_baseline_fallbacks for trial in trials
+            ),
+            "predicted_seconds_saved": round(
+                sum(
+                    trial.loaded_route_predicted_seconds_saved
+                    for trial in trials
+                ),
+                4,
+            ),
+        },
         "failures": [asdict(trial) for trial in failures],
     }
 
