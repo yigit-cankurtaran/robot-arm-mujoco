@@ -7,7 +7,12 @@ from pathlib import Path
 import mujoco.viewer
 
 from camera_panel import CameraPanelProcess
-from demo_runtime import sort_is_complete, sort_success_message
+from demo_runtime import (
+    sort_failure_message,
+    sort_has_failed,
+    sort_is_complete,
+    sort_success_message,
+)
 from env import FactoryFloorEnv
 from safety_monitor import (
     detect_safety_failure,
@@ -126,11 +131,8 @@ def main() -> None:
                     log_path = write_safety_failure(failure)
                     print(safety_failure_message(failure, log_path))
                     break
-                if env.controller_phase == "route_failed":
-                    print(
-                        "Route planning stopped: no collision-free, reachable "
-                        "pick approach was found, including from exact home."
-                    )
+                if sort_has_failed(env):
+                    print(sort_failure_message(env, wall_seconds))
                     break
                 if completed:
                     print(

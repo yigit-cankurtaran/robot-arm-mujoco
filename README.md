@@ -51,6 +51,12 @@ Gripper contact with the tabletop during a low grasp, normal fingertip contact
 with the selected object, and internal gripper contacts are intentionally
 excluded.
 
+A physically dropped held object is also terminal. After `0.08 s` beyond the
+`0.075 m` retention threshold, the controller records the part, motion phase,
+time, position, and gripper separation, prints a `Sort failed:` diagnostic, and
+closes the viewer/camera processes. A released object that misses its target bin
+follows the same shutdown path instead of leaving the simulation running.
+
 To test only the isolated camera process for three seconds:
 
 ```bash
@@ -77,6 +83,13 @@ Run the accuracy-gated speed benchmark after performance changes:
 The fixed suite covers seven single-shape seeds and four mixed three-part seeds.
 All previously successful cases must remain complete and collision-free. Use
 `--quick` for one single and one mixed smoke case.
+
+For the full speed-plus-accuracy gate (tests, fixed benchmark, and 20 randomized
+physical rollouts), run:
+
+```bash
+.venv/bin/python performance_evaluator.py
+```
 
 Check randomized colors, hidden matching assignments, and rendered observations:
 
@@ -121,7 +134,7 @@ labels; they are never included in the policy observation.
 - Each part is randomly assigned to one same-color bin, with both bins guaranteed to receive at least one part.
 - The controller uses position-and-orientation inverse kinematics on the Robotiq pinch site to move through pick, close, lift, transfer, open, and place phases instead of replaying fixed joint-space waypoints.
 - The policy observation contains a `240x240` RGB image and 15 robot proprioception values. It does not expose object poses, simulator colors, match IDs, or target bins.
-- During pickup, the Robotiq 2F-85 closes its four-bar finger linkage. A grasp is accepted only after both silicone pads contact the selected part; MuJoCo contact forces, friction, and gravity determine whether it stays in the gripper.
+- During pickup, the Robotiq 2F-85 closes its four-bar finger linkage. A grasp is accepted only after both silicone pads contact the selected part; the controller then holds the measured jaw width with a small physical preload instead of crushing toward full closure. MuJoCo contact forces, friction, and gravity determine whether it stays in the gripper.
 
 The original `demo.py` remains an oracle regression mode. The learned RGB mode
 is available after training:

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from demo_runtime import sort_has_failed
 from env import FactoryFloorEnv
 from safety_monitor import unsafe_contact_events
 
@@ -14,6 +15,8 @@ from safety_monitor import unsafe_contact_events
 class TrialMetrics:
     seed: int
     completed: bool
+    terminal_phase: str | None
+    object_drop_event: dict[str, object] | None
     cycle_time: float
     steps: int
     unsafe_contacts: int
@@ -26,6 +29,7 @@ class TrialMetrics:
     loaded_route_direct_shortcuts: int
     loaded_route_blended_shortcuts: int
     loaded_route_baseline_fallbacks: int
+    loaded_route_pass_throughs: int
     loaded_route_predicted_seconds_saved: float
 
 
@@ -66,7 +70,7 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
         ):
             completed = True
             break
-        if env.controller_phase in {"drop_failed", "route_failed"}:
+        if sort_has_failed(env):
             break
 
     command_array = np.asarray(commands)
@@ -77,6 +81,12 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
     return TrialMetrics(
         seed=seed,
         completed=completed,
+        terminal_phase=(env.controller_phase if sort_has_failed(env) else None),
+        object_drop_event=(
+            asdict(env.object_drop_event)
+            if env.object_drop_event is not None
+            else None
+        ),
         cycle_time=steps * env.control_dt,
         steps=steps,
         unsafe_contacts=len(unsafe_contacts),
@@ -97,6 +107,7 @@ def run_trial(seed: int, max_seconds: float) -> TrialMetrics:
         loaded_route_direct_shortcuts=env.loaded_route_direct_shortcuts,
         loaded_route_blended_shortcuts=env.loaded_route_blended_shortcuts,
         loaded_route_baseline_fallbacks=env.loaded_route_baseline_fallbacks,
+        loaded_route_pass_throughs=env.loaded_route_pass_throughs,
         loaded_route_predicted_seconds_saved=round(
             env.loaded_route_predicted_seconds_saved, 4
         ),
@@ -182,6 +193,9 @@ def main() -> None:
             ),
             "baseline_fallbacks": sum(
                 trial.loaded_route_baseline_fallbacks for trial in trials
+            ),
+            "pass_throughs": sum(
+                trial.loaded_route_pass_throughs for trial in trials
             ),
             "predicted_seconds_saved": round(
                 sum(

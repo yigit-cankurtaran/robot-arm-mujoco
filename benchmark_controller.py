@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from demo_runtime import sort_is_complete
+from demo_runtime import sort_has_failed, sort_is_complete
 from env import FactoryFloorEnv
 from safety_monitor import detect_safety_failure
 
@@ -34,6 +34,7 @@ class BenchmarkTrial:
     loaded_route_direct_shortcuts: int
     loaded_route_blended_shortcuts: int
     loaded_route_baseline_fallbacks: int
+    loaded_route_pass_throughs: int
     loaded_route_predicted_seconds_saved: float
     failure: str | None
 
@@ -68,7 +69,7 @@ def run_trial(kind: str, seed: int, part_count: int, max_steps: int) -> Benchmar
             if (
                 failure is not None
                 or sort_is_complete(env)
-                or env.controller_phase in {"drop_failed", "route_failed"}
+                or sort_has_failed(env)
             ):
                 break
         return BenchmarkTrial(
@@ -90,6 +91,7 @@ def run_trial(kind: str, seed: int, part_count: int, max_steps: int) -> Benchmar
             loaded_route_baseline_fallbacks=(
                 env.loaded_route_baseline_fallbacks
             ),
+            loaded_route_pass_throughs=env.loaded_route_pass_throughs,
             loaded_route_predicted_seconds_saved=round(
                 env.loaded_route_predicted_seconds_saved, 3
             ),
@@ -97,7 +99,7 @@ def run_trial(kind: str, seed: int, part_count: int, max_steps: int) -> Benchmar
                 failure.contacts[0].pair
                 if failure is not None
                 else env.controller_phase
-                if env.controller_phase in {"drop_failed", "route_failed"}
+                if sort_has_failed(env)
                 else None
             ),
         )
@@ -191,6 +193,9 @@ def main() -> None:
             ),
             "baseline_fallbacks": sum(
                 trial.loaded_route_baseline_fallbacks for trial in trials
+            ),
+            "pass_throughs": sum(
+                trial.loaded_route_pass_throughs for trial in trials
             ),
             "predicted_seconds_saved": round(
                 sum(

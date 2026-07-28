@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from demo_runtime import sort_has_failed
 from env import FactoryFloorEnv
 from visual_policy import RGBVisualPolicy
 from visual_sort_demo import validated_commands
@@ -54,7 +55,7 @@ def main() -> None:
                     and len(env.completed_parts) == len(env.active_part_order)
                 ):
                     break
-                if env.controller_phase in {"drop_failed", "route_failed"}:
+                if sort_has_failed(env):
                     break
                 if env.controller_phase == "idle" and replans < 3:
                     replan_rgb = env.render_rgb()
@@ -88,6 +89,9 @@ def main() -> None:
                     "detected_parts": initial_detected_parts,
                     "steps": steps,
                     "completed": len(env.completed_parts),
+                    "terminal_phase": (
+                        env.controller_phase if sort_has_failed(env) else None
+                    ),
                     "replans": replans,
                     "correct_destinations": correct_destinations,
                     "adapter": adapter,

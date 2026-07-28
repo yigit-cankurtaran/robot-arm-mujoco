@@ -73,6 +73,18 @@ class LoadedRoutePlan:
     baseline_duration: float
 
 
+@dataclass(frozen=True)
+class ObjectDropEvent:
+    """Snapshot captured when a physically held object leaves the gripper."""
+
+    part_name: str
+    detected_time: float
+    controller_phase: str
+    part_position: tuple[float, float, float]
+    ee_position: tuple[float, float, float]
+    separation: float
+
+
 class FactoryFloorEnv:
     def __init__(
         self,
@@ -252,8 +264,14 @@ class FactoryFloorEnv:
         self.grasp_close_duration = 0.70
         self.grasp_settle_duration = 0.20
         self.grasp_loss_timeout = 0.08
+        self.max_grasp_separation = 0.075
         self.gripper_open_ctrl = 0.0
         self.gripper_close_ctrl = 255.0
+        # Once both pads contact an object, hold the measured jaw width with a
+        # small position preload instead of continuing toward fully closed.
+        # This mirrors a real contact/force-limited grasp controller and keeps
+        # thin objects from being squeezed past the useful pad contact patch.
+        self.gripper_hold_preload = 0.04
         self.gripper_release_duration = 0.20
         self.bin_inner_half_width = 0.085
 
@@ -333,6 +351,10 @@ class FactoryFloorEnv:
                 "geom": "part_brick_geom",
                 "support_height": 0.016,
                 "motion_profile": "stable",
+                # Seat the thin box farther down the pads. With the generic
+                # low-profile offset, some yaw angles make bilateral contact
+                # only after the tendon is effectively fully closed.
+                "max_grasp_center_offset": 0.010,
             },
         }
         self.part_order = list(self.part_specs)
@@ -491,6 +513,8 @@ class FactoryFloorEnv:
         self.home_ee_target = self.data.site_xpos[self.ee_site_id].copy()
 
         self.holding_part: str | None = None
+        self.gripper_hold_ctrl: float | None = None
+        self.object_drop_event: ObjectDropEvent | None = None
         self.released_part: str | None = None
         self.released_target_bin: str | None = None
         self.drop_settle_elapsed = 0.0
@@ -503,7 +527,11 @@ class FactoryFloorEnv:
         self.last_pick_hover_target = self.home_ee_target.copy()
         # Returning most of the way along the known-safe home trajectory clears
         # the bin, but the next pick may start before exact home convergence.
-        self.inter_pick_home_fraction = 0.8
+        # Start the next collision-preflighted pick after clearing 70% of the
+        # known-safe home corridor. A rejected pick sweep still falls back to
+        # exact home. The 0.65 candidate was faster in the fixed suite but
+        # caused a randomized transport drop, so 0.70 is the accuracy gate.
+        self.inter_pick_home_fraction = 0.70
         self.force_full_home_for_pick = False
         self.route_retry_from_home = False
         self.route_preflight_checks = 0
@@ -515,6 +543,8 @@ class FactoryFloorEnv:
         self.loaded_route_baseline_fallbacks = 0
         self.loaded_route_preflight_rejections = 0
         self.loaded_route_predicted_seconds_saved = 0.0
+        self.loaded_route_pass_throughs = 0
+        self.loaded_route_pass_through_checked = False
         self.spawn_layout: dict[str, np.ndarray] = {}
 
         self.trajectory_phase: str | None = None
@@ -725,6 +755,8 @@ class FactoryFloorEnv:
         self._randomize_part_layout()
         mujoco.mj_forward(self.model, self.data)
         self.holding_part = None
+        self.gripper_hold_ctrl = None
+        self.object_drop_event = None
         self.released_part = None
         self.released_target_bin = None
         self.drop_settle_elapsed = 0.0
@@ -749,6 +781,8 @@ class FactoryFloorEnv:
         self.loaded_route_baseline_fallbacks = 0
         self.loaded_route_preflight_rejections = 0
         self.loaded_route_predicted_seconds_saved = 0.0
+        self.loaded_route_pass_throughs = 0
+        self.loaded_route_pass_through_checked = False
         self._reset_joint_trajectory()
         self.rgb_frame_counter = 0
         self.last_rgb = None
@@ -852,6 +886,7 @@ class FactoryFloorEnv:
             "return_home",
             "drop_failed",
             "grasp_failed",
+            "object_dropped",
             "route_failed",
         }:
             # Cartesian position alone has several UR5e solutions. Returning to
@@ -1324,6 +1359,19 @@ class FactoryFloorEnv:
             duration,
         )
 
+    def _loaded_pass_through_is_safe(self, goal: np.ndarray) -> bool:
+        """Check a derivative-preserving replan from the current command."""
+        duration, coefficients = self._plan_joint_segment(
+            self.data.ctrl[: self.arm_dofs].copy(),
+            goal,
+            self.trajectory_velocity.copy(),
+            self.trajectory_acceleration.copy(),
+            "move_to_bin_hover",
+        )
+        return self._swept_trajectory_is_collision_free(
+            coefficients, duration
+        )
+
     def _plan_loaded_route(self) -> LoadedRoutePlan | None:
         """Choose the quickest safe joint route from pick hover to bin hover."""
         part_name = self.holding_part
@@ -1446,6 +1494,7 @@ class FactoryFloorEnv:
             baseline_duration=float(baseline_duration),
         )
         self.loaded_route_plan = plan
+        self.loaded_route_pass_through_checked = False
         self.loaded_route_plans += 1
         if kind == "direct":
             self.loaded_route_direct_shortcuts += 1
@@ -1747,9 +1796,20 @@ class FactoryFloorEnv:
                 )
                 < 0.06
             )
-            if self._trajectory_complete() and (
-                baseline_reached or shortcut_waypoint_reached
+            waypoint_reached = baseline_reached or shortcut_waypoint_reached
+            if (
+                waypoint_reached
+                and not self._trajectory_complete()
+                and not self.loaded_route_pass_through_checked
             ):
+                self.loaded_route_pass_through_checked = True
+                if self._loaded_pass_through_is_safe(
+                    loaded_plan.bin_hover_goal
+                ):
+                    self.loaded_route_pass_throughs += 1
+                    self.controller_phase = "move_to_bin_hover"
+                    return
+            if self._trajectory_complete() and waypoint_reached:
                 self.controller_phase = "move_to_bin_hover"
             return
 
@@ -1848,11 +1908,15 @@ class FactoryFloorEnv:
 
         if self.controller_phase == "grasp_failed":
             self.holding_part = None
+            self.gripper_hold_ctrl = None
             self.active_part = None
             self.last_pick_hover_target = self.home_ee_target.copy()
             self.controller_phase = "return_home"
 
         if self.controller_phase == "route_failed":
+            return
+
+        if self.controller_phase == "object_dropped":
             return
 
     def _controller_target_position(self) -> np.ndarray:
@@ -1861,6 +1925,7 @@ class FactoryFloorEnv:
             "return_home",
             "drop_failed",
             "grasp_failed",
+            "object_dropped",
             "route_failed",
         }:
             return self.home_ee_target
@@ -2057,8 +2122,13 @@ class FactoryFloorEnv:
         # object height after it has settled; a world-Z offset would become a
         # lateral pad error because this collision-safe approach is angled.
         support_height = float(self.part_specs[part_name]["support_height"])
+        center_offset_limit = float(
+            self.part_specs[part_name].get(
+                "max_grasp_center_offset", self.max_grasp_center_offset
+            )
+        )
         center_offset = self.grasp_table_clearance + min(
-            self.max_grasp_center_offset,
+            center_offset_limit,
             max(0.0, self.low_profile_grasp_height - support_height),
         )
         target[2] = (
@@ -2126,6 +2196,8 @@ class FactoryFloorEnv:
     def _update_task_progress(self) -> None:
         if self.controller_phase == "close_gripper" and self.active_part is not None:
             if self._has_bilateral_pad_contact(self.active_part):
+                if self.holding_part != self.active_part:
+                    self.gripper_hold_ctrl = self._gripper_contact_hold_control()
                 self.holding_part = self.active_part
                 self.grasp_lost_elapsed = 0.0
             return
@@ -2143,7 +2215,25 @@ class FactoryFloorEnv:
             else:
                 self.grasp_lost_elapsed += self.control_dt
                 if self.grasp_lost_elapsed >= self.grasp_loss_timeout:
+                    part_name = self.holding_part
+                    origin_phase = self.controller_phase
+                    part_position = self.data.xpos[
+                        self.part_body_ids[part_name]
+                    ].copy()
+                    ee_position = self.data.site_xpos[self.ee_site_id].copy()
+                    self.object_drop_event = ObjectDropEvent(
+                        part_name=part_name,
+                        detected_time=float(self.data.time),
+                        controller_phase=origin_phase,
+                        part_position=tuple(float(value) for value in part_position),
+                        ee_position=tuple(float(value) for value in ee_position),
+                        separation=float(
+                            np.linalg.norm(part_position - ee_position)
+                        ),
+                    )
                     self.holding_part = None
+                    self.gripper_hold_ctrl = None
+                    self.controller_phase = "object_dropped"
 
     def _grasp_is_retained(self, part_name: str) -> bool:
         # Bilateral contact is required to declare the initial grasp. During
@@ -2155,7 +2245,7 @@ class FactoryFloorEnv:
             self.data.xpos[self.part_body_ids[part_name]]
             - self.data.site_xpos[self.ee_site_id]
         )
-        return bool(separation < 0.075)
+        return bool(separation < self.max_grasp_separation)
 
     def _has_bilateral_pad_contact(self, part_name: str) -> bool:
         part_geom_id = self.part_geom_ids[part_name]
@@ -2177,11 +2267,24 @@ class FactoryFloorEnv:
             "move_to_bin_hover",
             "move_to_drop",
         }
-        return (
-            self.gripper_close_ctrl
-            if self.controller_phase in closed_phases
-            else self.gripper_open_ctrl
-        )
+        if self.controller_phase not in closed_phases:
+            return self.gripper_open_ctrl
+        if self.holding_part is not None and self.gripper_hold_ctrl is not None:
+            return self.gripper_hold_ctrl
+        return self.gripper_close_ctrl
+
+    def _gripper_contact_hold_control(self) -> float:
+        """Convert the contacted jaw width into a lightly preloaded command."""
+        actuator_id = self.gripper_actuator_id
+        current_length = float(self.data.actuator_length[actuator_id])
+        control_gain = float(self.model.actuator_gainprm[actuator_id, 0])
+        position_gain = -float(self.model.actuator_biasprm[actuator_id, 1])
+        if control_gain <= 0.0 or position_gain <= 0.0:
+            return self.gripper_close_ctrl
+        target_length = current_length + self.gripper_hold_preload
+        control = position_gain * target_length / control_gain
+        low, high = self.model.actuator_ctrlrange[actuator_id]
+        return float(np.clip(control, low, high))
 
     def _ee_close_to_pick(self, part_name: str, tol: float = 0.05) -> bool:
         target = self._pick_target(part_name)
@@ -2200,6 +2303,7 @@ class FactoryFloorEnv:
     def _release_part(self, part_name: str, bin_name: str) -> None:
         """Open the physical fingers without rewriting the part pose."""
         self.holding_part = None
+        self.gripper_hold_ctrl = None
         self.released_part = part_name
         self.released_target_bin = bin_name
         self.drop_settle_elapsed = 0.0
@@ -2289,6 +2393,18 @@ class FactoryFloorEnv:
             "active_part": self.active_part,
             "ee_position": self.data.site_xpos[self.ee_site_id].copy(),
             "holding_part": self.holding_part,
+            "object_drop_event": (
+                {
+                    "part_name": self.object_drop_event.part_name,
+                    "detected_time": self.object_drop_event.detected_time,
+                    "controller_phase": self.object_drop_event.controller_phase,
+                    "part_position": self.object_drop_event.part_position,
+                    "ee_position": self.object_drop_event.ee_position,
+                    "separation": self.object_drop_event.separation,
+                }
+                if self.object_drop_event is not None
+                else None
+            ),
             "released_part": self.released_part,
             "pick_direction_index": self.active_pick_direction_index,
             "route_preflight_checks": self.route_preflight_checks,
@@ -2314,6 +2430,7 @@ class FactoryFloorEnv:
             "loaded_route_predicted_seconds_saved": (
                 self.loaded_route_predicted_seconds_saved
             ),
+            "loaded_route_pass_throughs": self.loaded_route_pass_throughs,
             "sorted_counts": self._sorted_counts(),
             "parts": {
                 name: self._part_state(name)

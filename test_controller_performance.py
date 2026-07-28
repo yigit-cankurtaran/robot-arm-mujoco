@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from audit_motion import _unsafe_contact_pairs
-from env import FactoryFloorEnv
+from env import FactoryFloorEnv, LoadedRoutePlan
 
 
 def _advance_until_loaded_plan(
@@ -14,6 +14,24 @@ def _advance_until_loaded_plan(
         if env.loaded_route_plan is not None:
             return
     raise AssertionError("controller did not construct a loaded route")
+
+
+def _synthetic_loaded_transfer_env() -> FactoryFloorEnv:
+    env = FactoryFloorEnv(enable_rgb_observation=False)
+    env.holding_part = env.active_part_order[0]
+    env.controller_phase = "move_to_transfer"
+    env.trajectory_phase = "move_to_transfer"
+    env.trajectory_elapsed = 0.5
+    env.trajectory_duration = 1.0
+    env.loaded_route_plan = LoadedRoutePlan(
+        transfer_goal=env.home_ctrl.copy(),
+        bin_hover_goal=env.home_ctrl.copy(),
+        direct_to_bin=False,
+        kind="baseline",
+        predicted_duration=1.0,
+        baseline_duration=1.0,
+    )
+    return env
 
 
 def test_active_trajectory_reuses_latched_ik_goal() -> None:
@@ -188,12 +206,15 @@ def test_next_pick_branches_before_exact_home_only_after_safe_fraction() -> None
         env.controller_phase = "return_home"
         env.trajectory_phase = "return_home"
         env.trajectory_duration = 2.0
+        branch_time = (
+            env.inter_pick_home_fraction * env.trajectory_duration
+        )
 
-        env.trajectory_elapsed = 1.59
+        env.trajectory_elapsed = branch_time - 0.01
         env._advance_controller_state()
         assert env.controller_phase == "return_home"
 
-        env.trajectory_elapsed = 1.6
+        env.trajectory_elapsed = branch_time
         env._advance_controller_state()
         assert env.controller_phase == "move_to_pick_hover"
     finally:
@@ -264,6 +285,123 @@ def test_mid_trajectory_replan_preserves_derivative_state_and_limits() -> None:
             second_goal,
             atol=1e-10,
         )
+    finally:
+        env.close()
+
+
+def test_loaded_pass_through_requires_waypoint() -> None:
+    env = _synthetic_loaded_transfer_env()
+    try:
+        def not_at_waypoint(*_args, **_kwargs) -> bool:
+            return False
+
+        def safe_successor(_goal: np.ndarray) -> bool:
+            return True
+
+        env._ee_close_to_position = not_at_waypoint
+        env._loaded_pass_through_is_safe = safe_successor
+        env._advance_controller_state()
+        assert env.controller_phase == "move_to_transfer"
+        assert not env.loaded_route_pass_through_checked
+    finally:
+        env.close()
+
+
+def test_loaded_pass_through_rejected_successor_is_not_retried() -> None:
+    env = _synthetic_loaded_transfer_env()
+    calls = 0
+    try:
+        def at_waypoint(*_args, **_kwargs) -> bool:
+            return True
+
+        def unsafe_successor(_goal: np.ndarray) -> bool:
+            nonlocal calls
+            calls += 1
+            return False
+
+        env._ee_close_to_position = at_waypoint
+        env._loaded_pass_through_is_safe = unsafe_successor
+        env._advance_controller_state()
+        assert env.controller_phase == "move_to_transfer"
+        assert env.loaded_route_pass_through_checked
+        env._advance_controller_state()
+        assert env.controller_phase == "move_to_transfer"
+        assert calls == 1
+    finally:
+        env.close()
+
+
+def test_loaded_pass_through_safe_successor_changes_phase() -> None:
+    env = _synthetic_loaded_transfer_env()
+    try:
+        def at_waypoint(*_args, **_kwargs) -> bool:
+            return True
+
+        def safe_successor(_goal: np.ndarray) -> bool:
+            return True
+
+        env._ee_close_to_position = at_waypoint
+        env._loaded_pass_through_is_safe = safe_successor
+        env._advance_controller_state()
+        assert env.controller_phase == "move_to_bin_hover"
+        assert env.loaded_route_pass_through_checked
+        assert env.loaded_route_pass_throughs == 1
+    finally:
+        env.close()
+
+
+def test_physical_rollout_exercises_safe_loaded_pass_through() -> None:
+    env = FactoryFloorEnv(
+        enable_rgb_observation=False,
+        min_active_parts=3,
+        max_active_parts=3,
+    )
+    env.random_state = np.random.default_rng(0)
+    env.reset()
+    unsafe_contacts: set[str] = set()
+    observed_pass_through = False
+    previous_count = 0
+    try:
+        for _ in range(5_000):
+            env.scripted_step()
+            unsafe_contacts.update(_unsafe_contact_pairs(env))
+            if env.loaded_route_pass_throughs > previous_count:
+                observed_pass_through = True
+                previous_count = env.loaded_route_pass_throughs
+                elapsed = np.linspace(0.0, env.trajectory_duration, 1001)
+                _, velocity, acceleration, jerk = env._quintic_state(
+                    env.trajectory_coefficients,
+                    env.trajectory_duration,
+                    elapsed,
+                )
+                limits = env._trajectory_derivative_limits(
+                    "move_to_bin_hover"
+                )
+                assert np.all(
+                    np.max(np.abs(velocity), axis=0) <= limits[0] + 1e-9
+                )
+                assert np.all(
+                    np.max(np.abs(acceleration), axis=0)
+                    <= limits[1] + 1e-9
+                )
+                assert np.all(
+                    np.max(np.abs(jerk), axis=0)
+                    <= env.trajectory_jerk_margin * limits[2] + 1e-9
+                )
+                assert env._swept_trajectory_is_collision_free(
+                    env.trajectory_coefficients,
+                    env.trajectory_duration,
+                )
+            if (
+                len(env.completed_parts) == len(env.active_part_order)
+                and env.controller_phase == "idle"
+            ):
+                break
+
+        assert observed_pass_through
+        assert len(env.completed_parts) == len(env.active_part_order)
+        assert env.controller_phase == "idle"
+        assert unsafe_contacts == set()
     finally:
         env.close()
 
