@@ -2,6 +2,12 @@
 
 This project uses the official MuJoCo Menagerie `universal_robots_ur5e` model inside a custom visual pick-and-sort workcell. Every episode generates new, unlabeled colors and randomly assigns parts to same-color bins. It includes both an oracle regression mode and a trained RGB-only visual planner feeding the classical motion controller.
 
+## Demo
+
+[![Watch the complete five-part autonomous sorting run](https://img.youtube.com/vi/i6-OD7Yug3o/maxresdefault.jpg)](https://youtu.be/i6-OD7Yug3o)
+
+[Watch the complete five-part autonomous sorting run on YouTube](https://youtu.be/i6-OD7Yug3o).
+
 Arm model:
 
 - MuJoCo Menagerie UR5e: https://github.com/google-deepmind/mujoco_menagerie/tree/main/universal_robots_ur5e
@@ -17,8 +23,6 @@ For a detailed explanation of the entire codebase, start with the
 ## Workcell Preview
 
 ![MuJoCo UR5e pick-and-sort workcell with two bins and randomized parts](assets/readme/workcell-overview.png)
-
-[Watch a complete five-part sorting run on YouTube](https://youtu.be/i6-OD7Yug3o).
 
 The simulated cell combines the UR5e, Robotiq 2F-85 gripper, randomized feed
 parts, two movable target bins, and an overhead policy camera. Colors, active
