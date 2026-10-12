@@ -18,6 +18,8 @@ For a detailed explanation of the entire codebase, start with the
 
 ![MuJoCo UR5e pick-and-sort workcell with two bins and randomized parts](assets/readme/workcell-overview.png)
 
+[Watch a complete five-part sorting run on YouTube](https://youtu.be/i6-OD7Yug3o).
+
 The simulated cell combines the UR5e, Robotiq 2F-85 gripper, randomized feed
 parts, two movable target bins, and an overhead policy camera. Colors, active
 shapes, part positions, and part-to-bin assignments change on every reset.
