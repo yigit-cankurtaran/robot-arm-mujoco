@@ -14,6 +14,14 @@ under `third_party/menagerie/robotiq_2f85/`.
 For a detailed explanation of the entire codebase, start with the
 [project handbook](docs/README.md).
 
+## Workcell Preview
+
+![MuJoCo UR5e pick-and-sort workcell with two bins and randomized parts](assets/readme/workcell-overview.png)
+
+The simulated cell combines the UR5e, Robotiq 2F-85 gripper, randomized feed
+parts, two movable target bins, and an overhead policy camera. Colors, active
+shapes, part positions, and part-to-bin assignments change on every reset.
+
 ## Setup
 
 ```bash
@@ -28,7 +36,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 The demo opens the normal MuJoCo viewer plus a small panel showing the exact RGB
-frame supplied to the future visual policy. The panel runs in a separate process
+frame supplied to the visual policy. The panel runs in a separate process
 so its OpenCV/Cocoa event loop cannot conflict with MuJoCo's GLFW window. Press
 `q` or Escape in that panel to exit. Use `--no-camera-panel` to hide it.
 
@@ -36,6 +44,18 @@ The regular oracle demo labels that panel `ORACLE OVERLAY` and draws display-onl
 part/bin contours and matching arrows. `visual_sort_demo.py` labels it
 `VISUAL POLICY OVERLAY` and draws the learned detections instead. In both cases
 the underlying policy RGB remains unannotated.
+
+### Policy Camera Views
+
+| Unannotated policy input | Oracle display overlay |
+| --- | --- |
+| ![Raw RGB observation supplied to the visual policy](assets/readme/policy-observation.png) | ![Display-only oracle overlay showing detected parts, bins, and assignments](assets/readme/oracle-overlay.png) |
+
+The left image is the actual `240x240` RGB policy observation, shown at 2x
+nearest-neighbor scale by the camera panel. The right image annotates the same
+frame for the oracle demo only: green contours identify parts, blue contours
+identify bins, and red arrows show the privileged matching assignments. These
+annotations are never included in the policy input.
 
 After the final object settles in its bin, the arm returns fully home, prints a
 success line with object count, simulated time, wall time, and throughput, then
